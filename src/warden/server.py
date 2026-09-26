@@ -16,6 +16,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp_types import ToolAnnotations
 
+from . import ui as _ui
 from . import actions, audit, plan, policy, scanner, watchdog
 from .aws import AwsClients, error_code
 from .config import (
@@ -65,6 +66,17 @@ server = MCPServer("warden", instructions=INSTRUCTIONS)
 _lock = threading.Lock()
 _settings: Settings | None = None
 _clients: AwsClients | None = None
+
+
+
+def _with_ui(result: dict, build: Callable[[dict], str]) -> dict:
+    """Attach a ready-to-paste OpenUI dashboard (see warden.ui) unless the call failed."""
+    if isinstance(result, dict) and "error" not in result:
+        try:
+            result["ui"] = build(result)
+        except Exception as err:  # never let presentation break the data path
+            result["ui_error"] = f"{type(err).__name__}: {err}"
+    return result
 
 
 def configure(settings: Settings | None = None, clients: AwsClients | None = None) -> None:
@@ -179,7 +191,8 @@ def warden_status() -> dict[str, Any]:
     annotations=_READ,
 )
 def scan_for_waste() -> dict[str, Any]:
-    return _run(lambda settings, clients: scanner.scan(clients, settings))
+    return _run(lambda settings, clients: _with_ui(scanner.scan(clients, settings),
+                                                   lambda r: _ui.scan_ui(r, settings.mock)))
 
 
 @server.tool(
@@ -302,7 +315,7 @@ def list_warden_backups() -> dict[str, Any]:
     annotations=_READ,
 )
 def watchdog_verify(plan_id: str, action: str, resource_ids: list[str]) -> dict[str, Any]:
-    return _run(lambda s, c: watchdog.verify(c, s, plan_id, action, _ids(resource_ids)))
+    return _run(lambda s, c: _with_ui(watchdog.verify(c, s, plan_id, action, _ids(resource_ids)), _ui.watchdog_ui))
 
 
 @server.tool(
@@ -316,7 +329,7 @@ def watchdog_verify(plan_id: str, action: str, resource_ids: list[str]) -> dict[
     annotations=_READ,
 )
 def rollback_window() -> dict[str, Any]:
-    return _run(lambda s, c: watchdog.rollback_window(c, s))
+    return _run(lambda s, c: _with_ui(watchdog.rollback_window(c, s), _ui.rollback_ui))
 
 
 @server.tool(
@@ -360,7 +373,7 @@ def resource_history(resource_id: str, limit: int = 50) -> dict[str, Any]:
     annotations=_DESTRUCTIVE,
 )
 def quarantine_volumes(plan_id: str, volume_ids: list[str], signoff: str) -> dict[str, Any]:
-    return _run(lambda s, c: actions.quarantine_volumes(c, s, plan_id, _ids(volume_ids), signoff=signoff))
+    return _run(lambda s, c: _with_ui(actions.quarantine_volumes(c, s, plan_id, _ids(volume_ids), signoff=signoff), _ui.receipt_ui))
 
 
 @server.tool(
@@ -374,7 +387,7 @@ def quarantine_volumes(plan_id: str, volume_ids: list[str], signoff: str) -> dic
     annotations=_DESTRUCTIVE,
 )
 def recycle_snapshots(plan_id: str, snapshot_ids: list[str], signoff: str) -> dict[str, Any]:
-    return _run(lambda s, c: actions.recycle_snapshots(c, s, plan_id, _ids(snapshot_ids), signoff=signoff))
+    return _run(lambda s, c: _with_ui(actions.recycle_snapshots(c, s, plan_id, _ids(snapshot_ids), signoff=signoff), _ui.receipt_ui))
 
 
 @server.tool(
@@ -388,7 +401,7 @@ def recycle_snapshots(plan_id: str, snapshot_ids: list[str], signoff: str) -> di
     annotations=_DESTRUCTIVE,
 )
 def delete_snapshot_permanently(plan_id: str, snapshot_id: str, signoff: str) -> dict[str, Any]:
-    return _run(lambda s, c: actions.delete_snapshot_permanently(c, s, plan_id, snapshot_id, signoff=signoff))
+    return _run(lambda s, c: _with_ui(actions.delete_snapshot_permanently(c, s, plan_id, snapshot_id, signoff=signoff), _ui.receipt_ui))
 
 
 @server.tool(
@@ -402,7 +415,7 @@ def delete_snapshot_permanently(plan_id: str, snapshot_id: str, signoff: str) ->
     annotations=_REVERSIBLE,
 )
 def stop_instances(plan_id: str, instance_ids: list[str], signoff: str) -> dict[str, Any]:
-    return _run(lambda s, c: actions.stop_instances(c, s, plan_id, _ids(instance_ids), signoff=signoff))
+    return _run(lambda s, c: _with_ui(actions.stop_instances(c, s, plan_id, _ids(instance_ids), signoff=signoff), _ui.receipt_ui))
 
 
 @server.tool(
@@ -417,7 +430,7 @@ def stop_instances(plan_id: str, instance_ids: list[str], signoff: str) -> dict[
     annotations=_DESTRUCTIVE,
 )
 def release_address(plan_id: str, allocation_id: str, signoff: str) -> dict[str, Any]:
-    return _run(lambda s, c: actions.release_address(c, s, plan_id, allocation_id, signoff=signoff))
+    return _run(lambda s, c: _with_ui(actions.release_address(c, s, plan_id, allocation_id, signoff=signoff), _ui.receipt_ui))
 
 
 @server.tool(
@@ -433,7 +446,7 @@ def release_address(plan_id: str, allocation_id: str, signoff: str) -> dict[str,
     annotations=_REVERSIBLE,
 )
 def quarantine_addresses(plan_id: str, allocation_ids: list[str], signoff: str) -> dict[str, Any]:
-    return _run(lambda s, c: actions.quarantine_addresses(c, s, plan_id, _ids(allocation_ids), signoff=signoff))
+    return _run(lambda s, c: _with_ui(actions.quarantine_addresses(c, s, plan_id, _ids(allocation_ids), signoff=signoff), _ui.receipt_ui))
 
 
 # ---------------------------------------------------------------- undo tools
@@ -450,7 +463,7 @@ def quarantine_addresses(plan_id: str, allocation_ids: list[str], signoff: str) 
     annotations=_REVERSIBLE,
 )
 def restore_volume(backup_snapshot_id: str) -> dict[str, Any]:
-    return _run(lambda s, c: actions.restore_volume(c, s, backup_snapshot_id))
+    return _run(lambda s, c: _with_ui(actions.restore_volume(c, s, backup_snapshot_id), _ui.receipt_ui))
 
 
 @server.tool(
@@ -463,7 +476,7 @@ def restore_volume(backup_snapshot_id: str) -> dict[str, Any]:
     annotations=_REVERSIBLE,
 )
 def restore_snapshot(snapshot_id: str) -> dict[str, Any]:
-    return _run(lambda s, c: actions.restore_snapshot(c, s, snapshot_id))
+    return _run(lambda s, c: _with_ui(actions.restore_snapshot(c, s, snapshot_id), _ui.receipt_ui))
 
 
 @server.tool(
@@ -476,7 +489,7 @@ def restore_snapshot(snapshot_id: str) -> dict[str, Any]:
     annotations=_REVERSIBLE,
 )
 def start_instances(instance_ids: list[str]) -> dict[str, Any]:
-    return _run(lambda s, c: actions.start_instances(c, s, _ids(instance_ids)))
+    return _run(lambda s, c: _with_ui(actions.start_instances(c, s, _ids(instance_ids)), _ui.receipt_ui))
 
 
 @server.tool(
@@ -489,7 +502,7 @@ def start_instances(instance_ids: list[str]) -> dict[str, Any]:
     annotations=_REVERSIBLE,
 )
 def cancel_address_quarantine(allocation_id: str) -> dict[str, Any]:
-    return _run(lambda s, c: actions.cancel_address_quarantine(c, s, allocation_id))
+    return _run(lambda s, c: _with_ui(actions.cancel_address_quarantine(c, s, allocation_id), _ui.receipt_ui))
 
 
 # ---------------------------------------------------------------- entry point
