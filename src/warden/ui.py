@@ -54,15 +54,6 @@ def _tag(text: str, variant: str) -> str:
     return f"Tag({_q(text)}, null, \"sm\", {_q(variant)})"
 
 
-def _button(label: str, message: str, variant: str = "secondary") -> str:
-    return f"Button({_q(label)}, Action([@ToAssistant({_q(message, 400)})]), {_q(variant)})"
-
-
-def _open_button(label: str, url: str) -> str:
-    """A button that opens a URL (only Warden's own local console URL is ever passed here)."""
-    return f"Button({_q(label)}, Action([@OpenUrl({_q(url, 300)})]), \"secondary\")"
-
-
 def _kpi(name: str, label: str, value: str, note: str) -> str:
     return (f"{name} = Card([TextContent({_q(label)}, \"small\"), TextContent({_q(value)}, \"large-heavy\"), "
             f"TextContent({_q(note)}, \"small\")])")
@@ -126,31 +117,24 @@ def scan_ui(report: dict, mock: bool = False, console_url: str | None = None) ->
                 _tag("IRREVERSIBLE", "danger") if f.get("reversible") is False else _tag("Decide first", "warning")
                 for f in act]
         whys = [_q(f.get("why") or "; ".join(f.get("reasons") or []), 180) for f in act]
-        btns = [_button("Request approval" if f.get("verdict") == "act" else "Discuss",
-                        (f"Approve plan {plan_id}: {f.get('action')} {f.get('resource_id')}" if f.get("verdict") == "act"
-                         else f"Explain what you need from me to decide on {f.get('resource_id')}"),
-                        "primary" if f.get("reversible") else "secondary")
-                for f in act]
+        # TrueForge renders OpenUI without an action handler, so buttons would be dead: show what to TYPE instead.
+        says = [_tag(("approve " if f.get("verdict") == "act" else "explain ") + str(f.get("name") or f.get("resource_id")),
+                     "info" if f.get("reversible") else "neutral") for f in act]
         decide += [
             "decide = Card([dhdr, intro1, dtable, dbtns])",
             "dhdr = CardHeader(" + _q(f"Decide: {len(act)} item(s)") + ", \"Most urgent first\")",
-            "intro1 = Callout(\"success\", \"You stay in control\", \"Each button only REQUESTS an action. Warden's "
-            "independent Watchdog re-checks it, then TrueForge shows you an Allow / Deny card. Nothing changes until "
-            "you click Allow, and every item here can be undone.\")",
+            "intro1 = Callout(\"success\", \"You stay in control\", \"Typing 'approve ...' only REQUESTS an action. "
+            "Warden's independent Watchdog re-checks it, then TrueForge shows you an Allow / Deny card. Nothing "
+            "changes until you click Allow, and every item here can be undone.\")",
             "dtable = Table([Col(\"Resource\", " + _arr(names) + "), Col(\"Action\", " + _arr(actions)
-            + "), Col(\"Undo\", " + _arr(undo) + "), Col(\"\", "
-            + _arr(btns) + ", \"action\")])",
+            + "), Col(\"Undo\", " + _arr(undo) + "), Col(\"To act, type\", " + _arr(says) + ")])",
             "t6 = TabItem(\"why\", \"Why it is safe\", [whysteps])",
             "whysteps = Steps(" + _arr(f"StepsItem({n}, {w})" for n, w in zip(names, whys)) + ")",
         ]
-        safe_ids = [f.get("resource_id") for f in act if f.get("tier") == "safe_reversible"]
-        batch = [_button("Request approval for all safe & reversible items",
-                         f"Approve plan {plan_id}: every safe & reversible item ({', '.join(safe_ids)}), "
-                         "batched by action, one Watchdog sign-off and one approval per batch", "primary")] if safe_ids else []
-        batch.append(_button("⏳ Rollback window", "Show the rollback window"))
+        hint = "**Next:** type `approve all safe items`, or `approve <resource>` from the table. `show rollback window` lists everything you can undo."
         if console_url:
-            batch.append(_open_button("Open full dashboard ↗", console_url))
-        decide.append("dbtns = Buttons(" + _arr(batch) + ")")
+            hint += f" **Full dashboard:** {console_url}"
+        decide.append("dbtns = MarkDownRenderer(" + _q(hint, 400) + ", \"sunk\")")
     else:
         decide += ["decide = Card([none1])", "t6 = TabItem(\"why\", \"Why it is safe\", [none6])",
                    "none6 = TextContent(\"Nothing to act on.\")",
@@ -190,14 +174,16 @@ def scan_ui(report: dict, mock: bool = False, console_url: str | None = None) ->
     priced = [f for f in act if f.get("est_monthly_usd")]
     type_labels, type_values = _savings_by_type(priced)
     lines += [
-        "t4 = TabItem(\"savings\", \"Savings\", [stitle, stype, sbar, spie])",
+        "t4 = TabItem(\"savings\", \"Savings\", [stitle, stype, sbar, sc1, sc2, sc3])",
         "stitle = TextContent(" + _q(f"{_money(summary.get('est_monthly_savings_usd'))} per month, by resource type")
         + ", \"large-heavy\")",
         "stype = SingleStackedBarChart(" + _arr(type_labels) + ", " + _arr(type_values) + ")",
         "sbar = HorizontalBarChart(" + _arr(_q(f.get("name") or f.get("resource_id"), 40) for f in priced)
         + ", [Series(\"$ per month\", " + _arr(_num(f.get("est_monthly_usd")) for f in priced) + ")], \"grouped\", \"$ per month\")",
-        "spie = PieChart([\"Safe & reversible\", \"Needs your review\", \"Refused\"], ["
-        f"{tiers.get('safe_reversible', 0)}, {tiers.get('needs_review', 0)}, {len(keep)}], \"donut\")",
+        # PieChart takes no colours (three near-identical blues), so the tier split uses coloured callouts.
+        "sc1 = TextCallout(\"success\", " + _q(f"{tiers.get('safe_reversible', 0)} safe & reversible") + ", \"One approval per batch; undo in one click.\")",
+        "sc2 = TextCallout(\"warning\", " + _q(f"{tiers.get('needs_review', 0)} need your review") + ", \"Irreversible or unclear; a human decides.\")",
+        "sc3 = TextCallout(\"danger\", " + _q(f"{len(keep)} refused") + ", \"Warden will not touch these, and says why.\")",
     ]
 
     # Tab 5: how Warden decides.
@@ -269,17 +255,17 @@ def receipt_ui(receipt: dict, console_url: str | None = None) -> str:
     children = ["rc"]
     if results:
         children.append("rt")
-        undo_btns = [(_button("Undo", f"Undo: call {r['undo']['tool']} with {r['undo'].get('args')}")
-                      if r.get("undo") else _q("")) for r in results]
+        undo_says = [(_tag("undo " + str(r.get("resource_id")), "info") if r.get("undo") else _q("")) for r in results]
         lines.append("rt = Table([Col(\"Resource\", " + _arr(_q(r.get("resource_id")) for r in results)
                      + "), Col(\"Result\", " + _arr(_tag(str(r.get("status")), status_tag.get(r.get("status"), "neutral"))
                                                    for r in results)
                      + "), Col(\"Details\", " + _arr(_q(r.get("detail"), 70) for r in results)
-                     + "), Col(\"\", " + _arr(undo_btns) + ", \"action\")])")
+                     + "), Col(\"To undo, type\", " + _arr(undo_says) + ")])")
+    hint = "**Next:** type `show rollback window` to see every undo countdown."
     if console_url:
-        children.append("rcb")
-        lines.append("rcb = Buttons([" + _button("⏳ Rollback window", "Show the rollback window") + ", "
-                     + _open_button("Open full dashboard ↗", console_url) + "])")
+        hint += f" **Full dashboard:** {console_url}"
+    children.append("rcb")
+    lines.append("rcb = MarkDownRenderer(" + _q(hint, 300) + ", \"sunk\")")
     return _program(children, lines)
 
 
@@ -301,12 +287,12 @@ def rollback_ui(window: dict, console_url: str | None = None) -> str:
             + "), Col(\"Undo window\", " + _arr(_tag(str(i.get("countdown")), "danger" if i.get("countdown") == "expired"
                                                       else "success") for i in items)
             + "), Col(\"Flags\", " + _arr(_q("; ".join(i.get("flags") or []) or "none", 200) for i in items)
-            + "), Col(\"\", " + _arr((_button("Undo", f"Undo: call {i['undo']['tool']} with {i['undo'].get('args')}")
-                                      if i.get("undo") else _q("")) for i in items) + ", \"action\")])")
+            + "), Col(\"To undo, type\", " + _arr((_tag("undo " + str(i.get("resource_id")), "info")
+                                                   if i.get("undo") else _q("")) for i in items) + ")])")
     else:
         children.append("rwn")
         lines.append("rwn = TextContent(\"Nothing is waiting in a rollback window.\")")
     if console_url:
         children.append("rwb")
-        lines.append("rwb = Buttons([" + _open_button("Open full dashboard ↗ (live countdown)", console_url) + "])")
+        lines.append("rwb = MarkDownRenderer(" + _q(f"**Live ticking countdowns:** {console_url}", 300) + ", \"sunk\")")
     return _program(children, lines)

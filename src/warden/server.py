@@ -99,6 +99,24 @@ asyncio.run(main())
 # One sandbox exec call: writes Warden's proof script (quoted heredoc, so nothing needs escaping) and runs it.
 PROOF_COMMAND = "cat > /tmp/warden_prove.py <<'WARDEN_EOF'\n" + PROOF_SCRIPT + "WARDEN_EOF\npython3 /tmp/warden_prove.py"
 
+LAST_SCAN_FILE = "last_scan.json"  # the latest scan report, read by the Warden Console (warden.console)
+
+
+def _save_last_scan(settings: Settings, report: dict) -> None:
+    """Best effort: keep the latest report (without presentation keys) for the read-only console."""
+    try:
+        audit.write_json_atomic(settings.state_dir / LAST_SCAN_FILE,
+                                {k: v for k, v in report.items() if k not in ("ui", "ui_error", "proof_command")})
+    except OSError:
+        pass
+
+
+
+def _console_url(settings: Settings) -> str:
+    """Where Warden's read-only console is served (same server, loopback)."""
+    host = "127.0.0.1" if settings.host in ("0.0.0.0", "::", "") else settings.host
+    return f"http://{host}:{settings.port}/console"
+
 def _with_ui(result: dict, build: Callable[[dict], str]) -> dict:
     """Attach a ready-to-paste OpenUI dashboard (see warden.ui) unless the call failed."""
     if isinstance(result, dict) and "error" not in result:
@@ -222,8 +240,9 @@ def warden_status() -> dict[str, Any]:
 )
 def scan_for_waste() -> dict[str, Any]:
     def body(settings: Settings, clients: AwsClients) -> dict:
-        result = _with_ui(scanner.scan(clients, settings), lambda r: _ui.scan_ui(r, settings.mock))
+        result = _with_ui(scanner.scan(clients, settings), lambda r: _ui.scan_ui(r, settings.mock, _console_url(settings)))
         result["proof_command"] = PROOF_COMMAND
+        _save_last_scan(settings, result)
         return result
 
     return _run(body)
@@ -363,7 +382,7 @@ def watchdog_verify(plan_id: str, action: str, resource_ids: list[str]) -> dict[
     annotations=_READ,
 )
 def rollback_window() -> dict[str, Any]:
-    return _run(lambda s, c: _with_ui(watchdog.rollback_window(c, s), _ui.rollback_ui))
+    return _run(lambda s, c: _with_ui(watchdog.rollback_window(c, s), lambda r: _ui.rollback_ui(r, _console_url(s))))
 
 
 @server.tool(
@@ -407,7 +426,7 @@ def resource_history(resource_id: str, limit: int = 50) -> dict[str, Any]:
     annotations=_DESTRUCTIVE,
 )
 def quarantine_volumes(plan_id: str, volume_ids: list[str], signoff: str) -> dict[str, Any]:
-    return _run(lambda s, c: _with_ui(actions.quarantine_volumes(c, s, plan_id, _ids(volume_ids), signoff=signoff), _ui.receipt_ui))
+    return _run(lambda s, c: _with_ui(actions.quarantine_volumes(c, s, plan_id, _ids(volume_ids), signoff=signoff), lambda r: _ui.receipt_ui(r, _console_url(s))))
 
 
 @server.tool(
@@ -421,7 +440,7 @@ def quarantine_volumes(plan_id: str, volume_ids: list[str], signoff: str) -> dic
     annotations=_DESTRUCTIVE,
 )
 def recycle_snapshots(plan_id: str, snapshot_ids: list[str], signoff: str) -> dict[str, Any]:
-    return _run(lambda s, c: _with_ui(actions.recycle_snapshots(c, s, plan_id, _ids(snapshot_ids), signoff=signoff), _ui.receipt_ui))
+    return _run(lambda s, c: _with_ui(actions.recycle_snapshots(c, s, plan_id, _ids(snapshot_ids), signoff=signoff), lambda r: _ui.receipt_ui(r, _console_url(s))))
 
 
 @server.tool(
@@ -435,7 +454,7 @@ def recycle_snapshots(plan_id: str, snapshot_ids: list[str], signoff: str) -> di
     annotations=_DESTRUCTIVE,
 )
 def delete_snapshot_permanently(plan_id: str, snapshot_id: str, signoff: str) -> dict[str, Any]:
-    return _run(lambda s, c: _with_ui(actions.delete_snapshot_permanently(c, s, plan_id, snapshot_id, signoff=signoff), _ui.receipt_ui))
+    return _run(lambda s, c: _with_ui(actions.delete_snapshot_permanently(c, s, plan_id, snapshot_id, signoff=signoff), lambda r: _ui.receipt_ui(r, _console_url(s))))
 
 
 @server.tool(
@@ -449,7 +468,7 @@ def delete_snapshot_permanently(plan_id: str, snapshot_id: str, signoff: str) ->
     annotations=_REVERSIBLE,
 )
 def stop_instances(plan_id: str, instance_ids: list[str], signoff: str) -> dict[str, Any]:
-    return _run(lambda s, c: _with_ui(actions.stop_instances(c, s, plan_id, _ids(instance_ids), signoff=signoff), _ui.receipt_ui))
+    return _run(lambda s, c: _with_ui(actions.stop_instances(c, s, plan_id, _ids(instance_ids), signoff=signoff), lambda r: _ui.receipt_ui(r, _console_url(s))))
 
 
 @server.tool(
@@ -464,7 +483,7 @@ def stop_instances(plan_id: str, instance_ids: list[str], signoff: str) -> dict[
     annotations=_DESTRUCTIVE,
 )
 def release_address(plan_id: str, allocation_id: str, signoff: str) -> dict[str, Any]:
-    return _run(lambda s, c: _with_ui(actions.release_address(c, s, plan_id, allocation_id, signoff=signoff), _ui.receipt_ui))
+    return _run(lambda s, c: _with_ui(actions.release_address(c, s, plan_id, allocation_id, signoff=signoff), lambda r: _ui.receipt_ui(r, _console_url(s))))
 
 
 @server.tool(
@@ -480,7 +499,7 @@ def release_address(plan_id: str, allocation_id: str, signoff: str) -> dict[str,
     annotations=_REVERSIBLE,
 )
 def quarantine_addresses(plan_id: str, allocation_ids: list[str], signoff: str) -> dict[str, Any]:
-    return _run(lambda s, c: _with_ui(actions.quarantine_addresses(c, s, plan_id, _ids(allocation_ids), signoff=signoff), _ui.receipt_ui))
+    return _run(lambda s, c: _with_ui(actions.quarantine_addresses(c, s, plan_id, _ids(allocation_ids), signoff=signoff), lambda r: _ui.receipt_ui(r, _console_url(s))))
 
 
 # ---------------------------------------------------------------- undo tools
@@ -497,7 +516,7 @@ def quarantine_addresses(plan_id: str, allocation_ids: list[str], signoff: str) 
     annotations=_REVERSIBLE,
 )
 def restore_volume(backup_snapshot_id: str) -> dict[str, Any]:
-    return _run(lambda s, c: _with_ui(actions.restore_volume(c, s, backup_snapshot_id), _ui.receipt_ui))
+    return _run(lambda s, c: _with_ui(actions.restore_volume(c, s, backup_snapshot_id), lambda r: _ui.receipt_ui(r, _console_url(s))))
 
 
 @server.tool(
@@ -510,7 +529,7 @@ def restore_volume(backup_snapshot_id: str) -> dict[str, Any]:
     annotations=_REVERSIBLE,
 )
 def restore_snapshot(snapshot_id: str) -> dict[str, Any]:
-    return _run(lambda s, c: _with_ui(actions.restore_snapshot(c, s, snapshot_id), _ui.receipt_ui))
+    return _run(lambda s, c: _with_ui(actions.restore_snapshot(c, s, snapshot_id), lambda r: _ui.receipt_ui(r, _console_url(s))))
 
 
 @server.tool(
@@ -523,7 +542,7 @@ def restore_snapshot(snapshot_id: str) -> dict[str, Any]:
     annotations=_REVERSIBLE,
 )
 def start_instances(instance_ids: list[str]) -> dict[str, Any]:
-    return _run(lambda s, c: _with_ui(actions.start_instances(c, s, _ids(instance_ids)), _ui.receipt_ui))
+    return _run(lambda s, c: _with_ui(actions.start_instances(c, s, _ids(instance_ids)), lambda r: _ui.receipt_ui(r, _console_url(s))))
 
 
 @server.tool(
@@ -536,8 +555,14 @@ def start_instances(instance_ids: list[str]) -> dict[str, Any]:
     annotations=_REVERSIBLE,
 )
 def cancel_address_quarantine(allocation_id: str) -> dict[str, Any]:
-    return _run(lambda s, c: _with_ui(actions.cancel_address_quarantine(c, s, allocation_id), _ui.receipt_ui))
+    return _run(lambda s, c: _with_ui(actions.cancel_address_quarantine(c, s, allocation_id), lambda r: _ui.receipt_ui(r, _console_url(s))))
 
+
+# ---------------------------------------------------------------- read-only web console
+
+from . import console  # noqa: E402  (GET /console, /console/api/state, /console/api/simulator)
+
+console.register(server)
 
 # ---------------------------------------------------------------- entry point
 

@@ -63,7 +63,7 @@ def test_scan_ui_is_valid_and_shows_everything():
     program = ui.scan_ui(REPORT, mock=True)
     check_program(program)
     for text in ("vol-1", "eipalloc-1", "IRREVERSIBLE", "Prompt-injection attempt", "Production", "Leak: lt-a",
-                 "Simulated AWS", "Request approval", "Decide: 3 item(s)", "Why it is safe", "Approve plan plan-1: quarantine_volume vol-1"):
+                 "Simulated AWS", "To act, type", "Decide: 3 item(s)", "Why it is safe", "approve vol-1", "approve all safe items"):
         assert text in program
 
 
@@ -110,10 +110,12 @@ def test_console_links_are_valid_openui():
     url = "http://127.0.0.1:8000/console"
     program = ui.scan_ui(REPORT, mock=True, console_url=url)
     check_program(program)
-    assert '@OpenUrl("http://127.0.0.1:8000/console")' in program
+    assert "http://127.0.0.1:8000/console" in program
+    bare = STRING.sub('""', program)
+    assert "Button(" not in bare and "@ToAssistant" not in bare  # TrueForge renders OpenUI without an action handler
     assert "SingleStackedBarChart(" in program and "You stay in control" in program
     receipt = {"action": "quarantine_volume", "counts": {"done": 1}, "receipt_id": "r1",
                "results": [{"resource_id": "vol-1", "status": "done", "detail": "ok", "undo": None}]}
     check_program(ui.receipt_ui(receipt, console_url=url))
     check_program(ui.rollback_ui({"ledger": {"ok": True, "entries": 1}, "items": []}, console_url=url))
-    assert "@OpenUrl" not in ui.scan_ui(REPORT)  # no console link unless the server passes one
+    assert "/console" not in ui.scan_ui(REPORT)  # no console link unless the server passes one
