@@ -1,0 +1,13 @@
+import botocore.session
+s=botocore.session.get_session()
+L=s.get_component('data_loader')
+r=L.load_service_model('route53','paginators-1'); print(r["pagination"].get("ListHostedZones"), r["pagination"].get("ListResourceRecordSets"))
+e=L.load_service_model('elbv2','paginators-1'); print(list(e["pagination"]))
+sv=L.load_service_model('elbv2','service-2')
+print(sv["shapes"]["DescribeTargetHealthInput"])
+print(list(sv["shapes"]["TargetGroup"]["members"].keys()))
+ec=L.load_service_model('ec2','service-2')
+print(ec["shapes"]["ListSnapshotsInRecycleBinRequest"])
+print(ec["shapes"]["SnapshotRecycleBinInfo"])
+ep=L.load_service_model('ec2','paginators-1'); print(ep["pagination"].get("ListSnapshotsInRecycleBin"))
+print(ec["shapes"]["CreateTagsRequest"]["members"]["Resources"])

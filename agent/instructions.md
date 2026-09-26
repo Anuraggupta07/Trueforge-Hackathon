@@ -9,7 +9,7 @@ Several Warden tools return a `ui` field: a ready-made OpenUI dashboard built by
 ## Workflow
 
 1. **Status.** Call `warden_status`. If Warden is **frozen**, say every change is blocked and stop (you may still scan and report). If `ledger.ok` is false, say the audit ledger failed its integrity check.
-2. **Scan and prove it (sandbox).** Call `scan_for_waste`. When the human asks for proof or a change record, run a sandbox Python script that fetches data itself (`from mcp_client import call_tool`; `scan = await call_tool("warden", "scan_for_waste", {})`), saves `scan.json`, and prints per-tier counts and savings. Never copy tool JSON by hand.
+2. **Scan and prove it (sandbox).** Call `scan_for_waste`. When the human asks for proof, run the scan's `proof_command` verbatim as ONE sandbox shell command (it writes and runs Warden's proof script); report its output (it re-fetches the scan and recomputes the numbers independently). Never write your own parser or copy tool JSON by hand.
 3. **Show the dashboard.** Paste the scan's `ui` (rendering rule). It contains the decision list, every refusal with its reason, leaks with fixes, and savings. Tiers:
    - **Safe & reversible** (`safe_reversible`): can be undone in one click.
    - **Needs your review** (`needs_review`): a human must decide (for example "name suggests production but it is not tagged", or an irreversible step).
@@ -27,7 +27,7 @@ Several Warden tools return a `ui` field: a ready-made OpenUI dashboard built by
 6. **Approval.** If the human denies a call, leave those items untouched, say so, and move on. Never retry a denied call in another form.
 7. **Report results.** Paste the executor's `ui` (the receipt dashboard with Undo buttons), then note anything skipped or failed. Accept skips; never work around them. If a mutating call errors or times out, Warden may still have finished it: check `list_receipts` / `get_receipt` before saying anything.
 8. **Rollback countdown.** After actions, call `rollback_window` and paste its `ui`; explain any flag such as "in use again - quarantine void".
-9. **Change record (sandbox).** When asked, run a sandbox script that fetches each receipt itself (`await call_tool("warden", "get_receipt", {"receipt_id": ...})`) and renders `CHANGE-RECORD.md`: summary, evidence per resource, Watchdog sign-offs and approvals, results, rollback steps from each `undo` ("none - irreversible" when null), receipt and plan ids. Facts only from receipts. Offer it as a download.
+9. **Change record (sandbox).** When asked, run a sandbox script that fetches each receipt itself (`from mcp_client import call_tool`; `await call_tool("warden", "get_receipt", {"receipt_id": ...})`) and renders `CHANGE-RECORD.md`: summary, evidence per resource, Watchdog sign-offs and approvals, results, rollback steps from each `undo` ("none - irreversible" when null), receipt and plan ids. Facts only from receipts. Offer it as a download.
 
 ## Anxious questions
 

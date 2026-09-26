@@ -69,6 +69,36 @@ _clients: AwsClients | None = None
 
 
 
+
+PROOF_SCRIPT = """import asyncio
+from mcp_client import call_tool
+
+
+async def main():
+    scan = await call_tool("warden", "scan_for_waste", {})
+    scan = scan if "findings" in scan else scan.get("result", scan)
+    findings = scan["findings"]
+    tiers = {}
+    for f in findings:
+        tiers[f["tier"]] = tiers.get(f["tier"], 0) + 1
+    act = [f for f in findings if f["verdict"] == "act"]
+    total = round(sum(f.get("est_monthly_usd") or 0 for f in act), 2)
+    reported = scan["summary"]["est_monthly_savings_usd"]
+    print("plan", scan["plan_id"], "| findings", len(findings), "| tiers", tiers)
+    print(f"recomputed savings ${total:.2f}/month vs Warden's ${reported:.2f}:", "MATCH" if abs(total - reported) < 0.01 else "MISMATCH")
+    for f in act:
+        print(f"  {f['resource_id']:28} {f['action']:20} ${f.get('est_monthly_usd') or 0:.2f}")
+    for leak in scan["leaks"]:
+        print("  leak:", leak["launch_template_name"], "->", leak["fix"])
+
+
+asyncio.run(main())
+"""
+
+
+# One sandbox exec call: writes Warden's proof script (quoted heredoc, so nothing needs escaping) and runs it.
+PROOF_COMMAND = "cat > /tmp/warden_prove.py <<'WARDEN_EOF'\n" + PROOF_SCRIPT + "WARDEN_EOF\npython3 /tmp/warden_prove.py"
+
 def _with_ui(result: dict, build: Callable[[dict], str]) -> dict:
     """Attach a ready-to-paste OpenUI dashboard (see warden.ui) unless the call failed."""
     if isinstance(result, dict) and "error" not in result:
@@ -191,8 +221,12 @@ def warden_status() -> dict[str, Any]:
     annotations=_READ,
 )
 def scan_for_waste() -> dict[str, Any]:
-    return _run(lambda settings, clients: _with_ui(scanner.scan(clients, settings),
-                                                   lambda r: _ui.scan_ui(r, settings.mock)))
+    def body(settings: Settings, clients: AwsClients) -> dict:
+        result = _with_ui(scanner.scan(clients, settings), lambda r: _ui.scan_ui(r, settings.mock))
+        result["proof_command"] = PROOF_COMMAND
+        return result
+
+    return _run(body)
 
 
 @server.tool(

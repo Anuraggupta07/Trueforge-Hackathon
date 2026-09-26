@@ -268,9 +268,18 @@ def test_console_scripts_start_the_server():  # F7
 def test_sandbox_fetches_tool_data_itself():  # F5
     for text in (sa.load_instructions(), sa.REPORTER_INSTRUCTIONS):
         assert "from mcp_client import call_tool" in text
-        assert "call_tool(\"warden\", \"scan_for_waste\"" in text
         assert "Write the scan JSON" not in text and "write the scan JSON" not in text
+    assert "call_tool(\"warden\", \"scan_for_waste\"" in sa.REPORTER_INSTRUCTIONS
     text = sa.load_instructions()
+    # The warden agent runs Warden's own shipped proof script instead of writing a parser (live test: a
+    # model-written script guessed field names and silently printed zero findings).
+    assert "proof_command" in text and "verbatim" in text
+    from warden import server
+    assert 'call_tool("warden", "scan_for_waste", {})' in server.PROOF_SCRIPT
+    assert 'scan["findings"]' in server.PROOF_SCRIPT and "est_monthly_usd" in server.PROOF_SCRIPT
+    compile(server.PROOF_SCRIPT, "prove.py", "exec")
+    assert server.PROOF_COMMAND.startswith("cat > /tmp/warden_prove.py <<'WARDEN_EOF'") and server.PROOF_COMMAND.endswith("python3 /tmp/warden_prove.py")
+    assert "WARDEN_EOF" not in server.PROOF_SCRIPT
     assert "call_tool(\"warden\", \"get_receipt\"" in text
     assert "write the receipt JSON" not in text
 
