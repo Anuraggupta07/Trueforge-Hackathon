@@ -1,20 +1,28 @@
 [project]
-name = "cost-janitor"
+name = "warden"
 version = "0.1.0"
-description = "Add your description here"
+description = "Warden: approval-gated, reversible cloud cost cleanup agent built on TrueForge"
 authors = [
-    { name = "Anurag Gupta", email = "subscriptions@enerdatics.com" }
+    { name = "Anurag Gupta", email = "86231425+Anuraggupta07@users.noreply.github.com" }
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "boto3>=1.43.103",
+    "boto3[crt]>=1.43.103",
     "mcp>=2.2.0",
     "python-dotenv>=1.2.3",
+    "trueforge-sdk>=0.2.0",
 ]
 
 [project.scripts]
-cost-janitor = "cost_janitor:main"
+warden = "warden.server:main"
+warden-server = "warden.server:main"
 
 [build-system]
 requires = ["uv_build>=0.12.7,<0.13.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "moto[cloudtrail,cloudwatch,ec2,server]>=5.2.3",
+    "pytest>=9.1.1",
+]
