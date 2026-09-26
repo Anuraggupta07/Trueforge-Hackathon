@@ -4,7 +4,7 @@
 
 Built on **[TrueForge](https://github.com/truefoundry/trueforge)** for *Agents That Act*, a TrueFoundry × Polaris hackathon (26 September 2026).
 
-▶ **Demo video:** _link added at submission_ · ✅ **491 automated tests** · 🧠 Model via the **TrueFoundry AI Gateway** · 📦 Code runs in a **Daytona sandbox**
+▶ **[Watch the demo video (2:08)](https://drive.google.com/file/d/1KtGuFuV7kr3Nauys4P5XmJ3LaPaOv1cH/view?usp=sharing)** · ✅ **491 automated tests** · 🧠 Model via the **TrueFoundry AI Gateway** · 📦 Code runs in a **Daytona sandbox**
 
 ![Warden's dashboard inside TrueForge: KPI cards, the decision list, the "You stay in control" banner and the Refused tab catching a prompt-injection attempt](docs/images/dashboard.png)
 
