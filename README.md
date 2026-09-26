@@ -4,9 +4,9 @@
 
 Built on **[TrueForge](https://github.com/truefoundry/trueforge)** for *Agents That Act*, a TrueFoundry × Polaris hackathon (26 September 2026).
 
-▶ **Demo video:** _link added at submission_ · ✅ **400 automated tests** · 🧠 Model via the **TrueFoundry AI Gateway** · 📦 Code runs in a **Daytona sandbox**
+▶ **Demo video:** _link added at submission_ · ✅ **491 automated tests** · 🧠 Model via the **TrueFoundry AI Gateway** · 📦 Code runs in a **Daytona sandbox**
 
-![Warden's dashboard inside TrueForge: KPI cards, the decision table with Request approval buttons, and the Refused tab catching a prompt-injection attempt](docs/images/dashboard.png)
+![Warden's dashboard inside TrueForge: KPI cards, the decision list, the "You stay in control" banner and the Refused tab catching a prompt-injection attempt](docs/images/dashboard.png)
 
 > **Honest status:** our new AWS account never finished activating (every region returned `OptInRequired`), so the demo runs against a **local AWS simulator**, clearly labelled *"Simulated AWS"* on screen. TrueForge, the AI model, the Daytona sandbox and all of Warden's code are real and unchanged. Switching to a real AWS account is one line in `.env`. [Details below.](#honest-notes)
 
@@ -137,12 +137,37 @@ OUTBOUND_URL_ALLOWED_HOSTS='["127.0.0.1"]' npx @truefoundry/trueforge@latest   #
 TRUEFORGE_MODEL=truefoundry/<your-model> uv run python agent/setup_agent.py
 ```
 
-Then open **http://localhost:8790 → Agents → warden** and type **"Scan for waste and propose the first action"**.
+Then open **http://localhost:8790 → Agents → warden** and type **"Scan for waste and propose the first action"**. To act, type **`approve <resource>`** or **`approve all safe items`**. TrueForge asks you to Allow each action. Type **`undo <resource>`** to reverse one.
+
+The **Warden Console**, a read-only website served by Warden itself, is at **http://127.0.0.1:8000/console**.
 
 - **PowerShell:** set the variable first: `$env:OUTBOUND_URL_ALLOWED_HOSTS='["127.0.0.1"]'; npx @truefoundry/trueforge@latest`
 - **Clean up:** `uv run python scripts/reset.py --yes` (only deletes `warden:demo=true` resources)
 - **Tests:** `uv run python -m pytest -q`
 - **Windows/OneDrive:** if `uv sync` fails with a hardlink error, run `UV_LINK_MODE=copy uv sync`
+
+---
+
+## Warden Console
+
+A read-only website served by the Warden server at `/console`, shown next to the TrueForge chat during demos. It has 8 tabs:
+
+- **About:** the problem, how a cleanup works, the architecture and the safety locks
+- **Overview · Decide · Refused · Leaks:** live views of the latest scan
+- **Rollback:** a live, ticking undo countdown for every item
+- **Ledger:** the hash chain, checked, as a timeline
+- **Simulator:** the resources inside the local AWS simulator, refreshed every 5 seconds, so a deleted disk visibly disappears
+
+Every change still happens only in TrueForge, with approval. The console just shows state.
+
+![Warden Console: About tab with the architecture diagram and safety locks](docs/images/console-about.png)
+
+<details>
+<summary><b>Simulator tab</b> (live view of the AWS simulator)</summary>
+
+![Warden Console: Simulator tab](docs/images/console-simulator.png)
+
+</details>
 
 ---
 
@@ -178,7 +203,7 @@ AWS credentials stay inside the Warden server. The sandbox only runs analysis co
 - A custom **MCP connector** (19 tools)
 - **Tool approval** on all 10 action tools
 - The **Daytona sandbox**
-- **Generative UI** (OpenUI dashboards)
+- **Generative UI** (OpenUI dashboards built by Warden from its own data)
 - **Ask-user questions**
 - The agent **defined in code** (`agent/setup_agent.py`)
 - A model through the **TrueFoundry AI Gateway**
@@ -237,7 +262,7 @@ src/warden/     scanner · policy · watchdog · actions · audit · ui · serve
 agent/          instructions.md (the agent's rules) · setup_agent.py (creates the TrueForge agent)
 scripts/        preflight · plant · reset · mock_server
 iam/            least-privilege IAM policy with production deny rules
-tests/          400 tests (moto-based; no AWS account needed)
+tests/          491 tests (moto-based; no AWS account needed)
 ```
 
 ---
