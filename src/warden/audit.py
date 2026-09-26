@@ -3,9 +3,10 @@
 Every audit.jsonl line carries seq (1-based), prev_hash ("GENESIS" for the first chained entry) and
 hash = sha256(prev_hash + canonical JSON of the entry without "hash"). Editing, deleting or reordering a
 line breaks the chain, which verify_ledger() reports. The newest (seq, hash) is also kept in state_dir/ledger.head,
-so a truncated tail or a deleted ledger is reported too. A write never moves the head anchor back over such a
-break: once the ledger falls behind its head, a ledger_tamper_detected entry is appended; the old anchor is kept in state_dir/ledger.broken, so verify_ledger keeps reporting the break. The chain is not signed: someone who can rewrite both
-files consistently can still forge history.
+so a truncated tail or a deleted ledger is reported too. The next write does not launder such a break: it
+appends a ledger_tamper_detected entry and keeps the old anchor in state_dir/ledger.broken, so verify_ledger
+keeps failing. The chain is not signed: someone who can rewrite all these files consistently can still forge
+history.
 """
 
 from __future__ import annotations
@@ -151,8 +152,7 @@ def audit(settings: Settings, event: str, **fields: Any) -> None:
             entry["prev_hash"] = prev_hash
             entry["hash"] = _entry_hash(prev_hash, entry)
             with open(path, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(entry, default=str) + "
-")
+                fh.write(json.dumps(entry, default=str) + "\n")
             seq, prev_hash = entry["seq"], entry["hash"]
         # Anchor the head outside the file so a truncated tail or a deleted ledger is detectable. Best effort:
         # a head that lags (e.g. Windows briefly locks the file) still verifies, it only anchors less.
@@ -301,29 +301,51 @@ def record_quarantine_void(settings: Settings, allocation_id: str, tags: dict[st
         audit(settings, "quarantine_void", resource_id=allocation_id, quarantined_at=at, detail=seen)
 
 
-def quarantine_problem(settings: Settings, allocation_id: str, tags: dict[str, str]) -> str | None:
+def _parse_iso(text: Any) -> datetime | None:
+    if not isinstance(text, str) or not text.strip():
+        return None
+    try:
+        dt = datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def quarantine_problem(
+    settings: Settings, allocation_id: str, tags: dict[str, str], now: datetime | None = None,
+    require_over: bool = True,
+) -> str | None:
     """Why this Elastic IP's quarantine cannot justify a release, or None if it can.
 
     The quarantine must be Warden's own (a done quarantine_address receipt recorded the same
-    warden:quarantined-at) and must not have been voided by the address being seen in use since.
+    warden:quarantined-at), must not have been voided by the address being seen in use since, and its
+    warden:quarantined-until tag must equal the window that receipt recorded. With require_over, that recorded
+    window must also have ended: the tags are mutable, so the receipt (not the tag) decides when release is allowed.
     """
     at = tags.get(TAG_QUARANTINED_AT)
     if not at:
         return f"no {TAG_QUARANTINED_AT} tag - the quarantine was not set by Warden"
-    matched = False
+    matched: dict | None = None
     for summary in list_receipts(settings, limit=100_000):
         if summary.get("action") != "quarantine_address":
             continue
         receipt = load_receipt(settings, str(summary.get("receipt_id"))) or {}
-        if any(r.get("resource_id") == allocation_id and r.get("status") == "done" and r.get("quarantined_at") == at
-               for r in receipt.get("results") or []):
-            matched = True
+        matched = next((r for r in receipt.get("results") or [] if r.get("resource_id") == allocation_id
+                        and r.get("status") == "done" and r.get("quarantined_at") == at), None)
+        if matched is not None:
             break
-    if not matched:
+    if matched is None:
         return "the quarantine was not set by Warden (no matching quarantine receipt)"
     void = _void_recorded(settings, allocation_id, at)
     if void is not None:
         return f"it was in use again during its quarantine (seen {void.get('ts')}) - the quarantine is void"
+    recorded = matched.get("quarantined_until")
+    ends = _parse_iso(recorded)
+    if ends is None or recorded != tags.get(TAG_QUARANTINED_UNTIL):
+        return (f"its {TAG_QUARANTINED_UNTIL} tag ({tags.get(TAG_QUARANTINED_UNTIL)!r}) does not match the window "
+                f"Warden recorded ({recorded!r}) - the quarantine tags were changed")
+    if require_over and ends > (now or _utcnow()):
+        return f"the quarantine window Warden recorded has not ended yet (ends {recorded})"
     return None
 
 

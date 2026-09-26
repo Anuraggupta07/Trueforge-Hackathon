@@ -746,7 +746,7 @@ def _address_finding(
         return _set_verdict(
             f, "keep", [f"in quarantine - releasable in {countdown((until - now).total_seconds())}"]
         )
-    problem = quarantine_problem(settings, addr["AllocationId"], tags)
+    problem = quarantine_problem(settings, addr["AllocationId"], tags, now=now)
     if problem:
         return _set_verdict(
             f, "act", [f"{problem}; quarantine it again for a fresh window (tag only, reversible)"],

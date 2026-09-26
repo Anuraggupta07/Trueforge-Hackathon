@@ -274,7 +274,9 @@ def _action_check(
                 )
             return f"address {ip} is associated with something now", []
         if action == "release_address":
-            problem = audit_mod.quarantine_problem(settings, rid, policy.tags_to_dict(res.get("Tags")))
+            problem = audit_mod.quarantine_problem(
+                settings, rid, policy.tags_to_dict(res.get("Tags")), now=datetime.fromtimestamp(now, timezone.utc)
+            )
             if problem:
                 return f"{problem}; quarantine it again (quarantine_address) before any release", []
             lines.append(f"{rid}: Warden's own quarantine (receipt matches) and not seen in use since")

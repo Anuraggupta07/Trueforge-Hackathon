@@ -456,11 +456,17 @@ def test_verify_fails_closed_when_dns_check_errors(aws, settings, monkeypatch):
 
 
 def warden_quarantine_receipt(aws, settings, alloc, at="2020-01-01T00:00:00Z") -> dict:
-    """Tag warden:quarantined-at as Warden does, write the matching receipt, return the fresh address."""
+    """Tag warden:quarantined-at as Warden does, write the matching receipt, return the fresh address.
+
+    The receipt records the same quarantined_at/quarantined_until as the address's tags, exactly as
+    actions.quarantine_addresses does, so release checks bind to it (the receipt, not the tag, decides).
+    """
     aws.ec2.create_tags(Resources=[alloc], Tags=[{"Key": TAG_QUARANTINED_AT, "Value": at}])
+    current = aws.ec2.describe_addresses(AllocationIds=[alloc])["Addresses"][0]
+    until = {t["Key"]: t["Value"] for t in current.get("Tags") or []}.get(TAG_QUARANTINED_UNTIL)
     audit.save_receipt(settings, {
         "receipt_id": audit.new_id("rcpt"), "action": "quarantine_address", "plan_id": "plan-x", "finished_at": at,
-        "results": [{"resource_id": alloc, "status": "done", "quarantined_at": at}],
+        "results": [{"resource_id": alloc, "status": "done", "quarantined_at": at, "quarantined_until": until}],
     })
     return aws.ec2.describe_addresses(AllocationIds=[alloc])["Addresses"][0]
 
@@ -492,6 +498,17 @@ def test_verify_release_refused_after_use_during_quarantine(aws, settings):  # b
     pid = make_plan(aws, settings, [("address", "release_address", addr)])
     result = watchdog.verify(aws, settings, pid, "release_address", [alloc])
     assert result["token"] is None and "void" in result["blocked"][alloc]
+
+
+def test_verify_release_uses_its_clock_for_the_recorded_window(aws, settings):
+    # verify(now=...) must judge the receipt's window with the same clock as the tag (not the wall clock).
+    ends = _iso(datetime.now(timezone.utc) + timedelta(minutes=10))
+    addr = make_address(aws, {TAG_QUARANTINED_UNTIL: ends})
+    alloc = addr["AllocationId"]
+    addr = warden_quarantine_receipt(aws, settings, alloc)
+    pid = make_plan(aws, settings, [("address", "release_address", addr)])
+    result = watchdog.verify(aws, settings, pid, "release_address", [alloc], now=time.time() + 20 * 60)
+    assert result["approved_ids"] == [alloc] and result["token"], result
 
 
 def test_verify_builds_the_dns_index_once_per_call(aws, settings, monkeypatch):  # demo F6

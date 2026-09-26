@@ -35,3 +35,45 @@ def aws(settings):
     """AwsClients backed by moto."""
     with mock_aws():
         yield AwsClients(settings)
+
+
+class _Clock:
+    """A shared offset added to every clock Warden reads (datetime.now / time.time in its modules)."""
+
+    def __init__(self) -> None:
+        self.offset = 0.0
+
+    def advance(self, seconds: float) -> None:
+        self.offset += seconds
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> _Clock:
+    """Let a test move Warden's wall clock forward, so a quarantine window passes for real.
+
+    Every Warden module sees the same shifted time, so tags, receipts, plans and sign-offs stay consistent;
+    nothing is back-dated or rewritten.
+    """
+    import time as real_time
+    import types
+    from datetime import datetime, timedelta
+
+    from warden import actions, audit, plan, scanner, server, watchdog
+
+    state = _Clock()
+
+    class ShiftedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            return datetime.now(tz) + timedelta(seconds=state.offset)
+
+    shifted_time = types.SimpleNamespace(**{k: getattr(real_time, k) for k in dir(real_time) if not k.startswith("__")})
+    shifted_time.time = lambda: real_time.time() + state.offset
+
+    for module in (actions, audit, scanner, server, watchdog):
+        if getattr(module, "datetime", None) is datetime:
+            monkeypatch.setattr(module, "datetime", ShiftedDatetime)
+    for module in (actions, plan, scanner, server, watchdog):
+        if getattr(module, "time", None) is real_time:
+            monkeypatch.setattr(module, "time", shifted_time)
+    return state

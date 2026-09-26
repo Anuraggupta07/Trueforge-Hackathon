@@ -4,9 +4,45 @@
 
 Built on [TrueForge](https://github.com/truefoundry/trueforge) for **Agents That Act**, a TrueFoundry × Polaris hackathon (26 September 2026).
 
-> 🚧 v1 is being built today. Setup steps and a demo video link will be added here before submission.
+**Demo video:** _link added at submission_ · **Tests:** 398 passing (`uv run python -m pytest -q`)
 
-**Run it:** start the Warden MCP server with `uv run warden-server` (it listens on `http://127.0.0.1:8000/mcp`), start TrueForge with `OUTBOUND_URL_ALLOWED_HOSTS='["127.0.0.1"]'` (its outbound URL guard blocks loopback hosts by default), then register the agent with `uv run python agent/setup_agent.py`. Plant the demo with `uv run python scripts/plant.py` at least ~25 minutes before scanning, so the idle server has post-boot CloudWatch data.
+> **Honest status.** Warden's code targets real AWS. The team's hackathon AWS account never finished activating: every region returned `OptInRequired` for EC2 and CloudWatch, and the account plan stayed `NOT_STARTED`. The demo therefore runs in **mock mode** against a local moto server. Warden says so on screen (the "Simulated AWS" banner and `aws_mode: MOCK`). The scanner, Watchdog, plan lock, receipts, undo and ledger are exactly the code that runs against real AWS. Pointing Warden at a real account is one `.env` change: remove `WARDEN_MOCK_ENDPOINT`.
+
+![Warden's dashboard inside TrueForge: KPI cards, a decision table with Request approval buttons, and the Refused tab with the prompt-injection attempt caught](docs/images/dashboard.png)
+
+<details>
+<summary>The full flow: request → Watchdog sign-off → TrueForge Allow card → receipt → "did you delete my prod disk?" answered from the ledger</summary>
+
+![Approval flow](docs/images/approval-flow.png)
+
+</details>
+
+## Run it
+
+You need Node.js 22.14+, [uv](https://docs.astral.sh/uv/), and a Daytona API key with `write:sandboxes`, `write:snapshots` and `delete:snapshots`.
+
+```bash
+git clone https://github.com/Anuraggupta07/Trueforge-Hackathon && cd Trueforge-Hackathon
+git checkout Trueforge_agent && uv sync
+cp .env.example .env          # keeps WARDEN_SCOPE_TAG=warden:demo=true: Warden only touches demo-tagged resources
+
+# 1. AWS: either real credentials (aws configure / aws login), or mock mode:
+uv run python scripts/mock_server.py          # terminal 1; then set WARDEN_MOCK_ENDPOINT=http://127.0.0.1:5000 in .env
+uv run python scripts/preflight.py            # read-only check of what the account allows
+uv run python scripts/plant.py                # plants the 9 demo items (on real AWS, plant >= 25 min before scanning)
+
+# 2. Warden's MCP server
+uv run warden-server                          # terminal 2; http://127.0.0.1:8000/mcp
+
+# 3. TrueForge (its outbound URL guard blocks loopback hosts unless allowed)
+OUTBOUND_URL_ALLOWED_HOSTS='["127.0.0.1"]' npx @truefoundry/trueforge@latest    # terminal 3; http://localhost:8790
+#    In TrueForge: Settings -> Models (we use the TrueFoundry AI Gateway provider) and Settings -> Sandbox providers (Daytona)
+
+# 4. Register the Warden connector and agent (all 10 mutating tools gated behind approval)
+TRUEFORGE_MODEL=truefoundry/<your-model> uv run python agent/setup_agent.py
+```
+
+Open **http://localhost:8790 → Agents → warden** and type **"Scan for waste and propose the first action"**. Clean up afterwards with `uv run python scripts/reset.py --yes`. On PowerShell, set the TrueForge variable first: `$env:OUTBOUND_URL_ALLOWED_HOSTS='["127.0.0.1"]'; npx @truefoundry/trueforge@latest`.
 
 ---
 
@@ -125,7 +161,7 @@ You (browser) ──► TrueForge chat UI (localhost:8790)
 - A custom **MCP connector**
 - **Tool approval** (`require_approval_for_tools`)
 - The **Daytona sandbox**
-- **Generative UI** (findings table, savings chart)
+- **Generative UI**: Warden builds OpenUI dashboards (KPI cards, decision table with approval buttons, refusals, leaks, savings, Watchdog, receipts, rollback countdown) from its own data, so the model pastes them rather than retyping ids or numbers
 - **Ask-user questions** for "review" items
 - The agent defined in code with the **Python SDK** (`agent/setup_agent.py`)
 - The **AI Gateway** for model access and the audit trail
@@ -161,7 +197,7 @@ The same demo runs against a local [moto](https://github.com/getmoto/moto) serve
 uv run python scripts/mock_server.py        # terminal 1: moto on http://127.0.0.1:5000
 # in .env: WARDEN_MOCK_ENDPOINT=http://127.0.0.1:5000
 uv run python scripts/plant.py              # terminal 2: plant the 9 items (scan right away)
-uv run warden                               # the MCP server, then connect TrueForge as usual
+uv run warden-server                        # the MCP server, then connect TrueForge as usual
 ```
 
 In mock mode every client uses dummy credentials and the local endpoint, so real AWS is never reached, and `warden_status` reports `aws_mode: MOCK`. moto lacks a few AWS features, so `src/warden/mock.py` fills them in openly: a simulated Recycle Bin (rules, bin, restore with the same snapshot id), instances that report launching 2 hours earlier (past the boot warm-up), a synthetic idle CloudWatch history for the idle server, and an empty CloudTrail. `plant.py` also creates the leaked worker disk and the AMI's snapshot itself, because moto doesn't create them. Every safety check, sign-off, receipt and undo path runs unchanged.

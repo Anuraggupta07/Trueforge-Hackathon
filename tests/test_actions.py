@@ -100,13 +100,14 @@ def make_address(aws, tags: dict[str, str] | None = None) -> dict:
 
 
 def make_quarantined_address(aws, settings) -> dict:
-    """An Elastic IP whose Warden quarantine (tags + receipt) ended in the past."""
+    """An Elastic IP whose Warden quarantine (tags + a receipt recording the same window) ended in the past."""
     addr = make_address(aws, QUARANTINE_OVER)
     audit.save_receipt(settings, {
         "receipt_id": audit.new_id("rcpt"), "action": "quarantine_address", "plan_id": "plan-x",
         "finished_at": QUARANTINE_OVER[TAG_QUARANTINED_AT],
         "results": [{"resource_id": addr["AllocationId"], "status": "done",
-                     "quarantined_at": QUARANTINE_OVER[TAG_QUARANTINED_AT]}],
+                     "quarantined_at": QUARANTINE_OVER[TAG_QUARANTINED_AT],
+                     "quarantined_until": QUARANTINE_OVER[TAG_QUARANTINED_UNTIL]}],
     })
     return addr
 
@@ -1116,7 +1117,7 @@ def test_release_refused_inside_quarantine_window(aws, settings):
     assert len(aws.ec2.describe_addresses()["Addresses"]) == 1
 
 
-def test_quarantine_then_release_after_window(aws, settings):
+def test_quarantine_then_release_after_window(aws, settings, clock):
     fast = dataclasses.replace(settings, quarantine_minutes=1)
     addr = make_address(aws)
     aid = addr["AllocationId"]
@@ -1128,14 +1129,32 @@ def test_quarantine_then_release_after_window(aws, settings):
     early = actions.release_address(aws, fast, pid2, aid, signoff=SIG)
     assert statuses(early) == ["skipped"] and "still in quarantine" in early["results"][0]["detail"]
 
-    # The window passes (simulated by back-dating the tag, then re-scanning into a fresh plan).
-    aws.ec2.create_tags(Resources=[aid], Tags=[{"Key": TAG_QUARANTINED_UNTIL, "Value": "2000-01-01T00:00:00Z"}])
+    # The window really passes (the clock moves; tags and receipt are untouched), then a fresh plan.
+    clock.advance(2 * 60)
     expired = aws.ec2.describe_addresses(AllocationIds=[aid])["Addresses"][0]
     pid3 = make_plan(aws, fast, [("address", "release_address", expired)])
     receipt = actions.release_address(aws, fast, pid3, aid, signoff=SIG)
     assert statuses(receipt) == ["done"], receipt
     assert "IRREVERSIBLE" in receipt["results"][0]["detail"]
     assert aws.ec2.describe_addresses()["Addresses"] == []
+
+
+def test_release_refused_when_quarantine_until_tag_moved_into_the_past(aws, settings):  # tags are mutable
+    addr = make_address(aws)
+    aid = addr["AllocationId"]
+    pid = make_plan(aws, settings, [("address", "quarantine_address", addr)])
+    res = actions.quarantine_addresses(aws, settings, pid, [aid], signoff=SIG)["results"][0]
+    assert res["status"] == "done"
+
+    # Someone edits the tag to end the window early; Warden's receipt still records the real window.
+    aws.ec2.create_tags(Resources=[aid], Tags=[{"Key": TAG_QUARANTINED_UNTIL, "Value": "2000-01-01T00:00:00Z"}])
+    tampered = aws.ec2.describe_addresses(AllocationIds=[aid])["Addresses"][0]
+    pid2 = make_plan(aws, settings, [("address", "release_address", tampered)])
+    receipt = actions.release_address(aws, settings, pid2, aid, signoff=SIG)
+    assert statuses(receipt) == ["skipped"], receipt
+    assert "tags were changed" in receipt["results"][0]["detail"]
+    assert res["quarantined_until"] in receipt["results"][0]["detail"]
+    assert len(aws.ec2.describe_addresses()["Addresses"]) == 1
 
 
 # ---------------------------------------------------------------- review fixes

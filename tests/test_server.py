@@ -183,7 +183,7 @@ def test_end_to_end_volume_with_watchdog_signoff(wired) -> None:
     assert tags["Name"] == "scratch" and tags["team"] == "data"
 
 
-def test_end_to_end_elastic_ip_quarantine_then_release(wired) -> None:
+def test_end_to_end_elastic_ip_quarantine_then_release(wired, clock) -> None:
     ec2 = wired.ec2
     alloc = _address(ec2)
 
@@ -215,8 +215,9 @@ def test_end_to_end_elastic_ip_quarantine_then_release(wired) -> None:
     assert item["undo"] == {"tool": "cancel_address_quarantine", "args": {"allocation_id": alloc}}
     assert "irreversible" in item["finalize"]
 
-    # Time passes: move the quarantine window into the past.
-    ec2.create_tags(Resources=[alloc], Tags=[{"Key": TAG_QUARANTINED_UNTIL, "Value": "2020-01-01T00:00:00Z"}])
+    # Time passes: the whole quarantine window (quarantine_minutes) elapses; tags and receipt are untouched.
+    assert TAG_QUARANTINED_UNTIL in {t["Key"] for t in ec2.describe_addresses(AllocationIds=[alloc])["Addresses"][0]["Tags"]}
+    clock.advance(server.warden_status()["quarantine_minutes"] * 60 + 60)
     later = server.scan_for_waste()
     ready = {f["resource_id"]: f for f in later["findings"]}[alloc]
     assert ready["verdict"] == "act" and ready["action"] == "release_address" and not ready["reversible"]

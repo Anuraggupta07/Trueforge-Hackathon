@@ -248,7 +248,7 @@ def receipt_ui(receipt: dict) -> str:
         lines.append("rt = Table([Col(\"Resource\", " + _arr(_q(r.get("resource_id")) for r in results)
                      + "), Col(\"Result\", " + _arr(_tag(str(r.get("status")), status_tag.get(r.get("status"), "neutral"))
                                                    for r in results)
-                     + "), Col(\"Details\", " + _arr(_q(r.get("detail"), 220) for r in results)
+                     + "), Col(\"Details\", " + _arr(_q(r.get("detail"), 70) for r in results)
                      + "), Col(\"\", " + _arr(undo_btns) + ", \"action\")])")
     return _program(children, lines)
 
