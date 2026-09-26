@@ -1,0 +1,76 @@
+"""boto3 client factory and small AWS helpers."""
+
+from __future__ import annotations
+
+from functools import cached_property
+from typing import Any, Callable
+
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
+
+from .config import Settings
+
+_BOTO_CONFIG = Config(retries={"mode": "adaptive", "max_attempts": 8})
+
+
+class AwsClients:
+    """Lazily created, cached boto3 clients for one region."""
+
+    def __init__(self, settings: Settings, session: boto3.Session | None = None) -> None:
+        self.settings = settings
+        self.session = session or boto3.Session(region_name=settings.region)
+        self._account_id: str | None = None
+
+    def _client(self, service: str) -> Any:
+        return self.session.client(service, region_name=self.settings.region, config=_BOTO_CONFIG)
+
+    @cached_property
+    def ec2(self) -> Any:
+        return self._client("ec2")
+
+    @cached_property
+    def cloudwatch(self) -> Any:
+        return self._client("cloudwatch")
+
+    @cached_property
+    def cloudtrail(self) -> Any:
+        return self._client("cloudtrail")
+
+    @cached_property
+    def rbin(self) -> Any:
+        return self._client("rbin")
+
+    @cached_property
+    def sts(self) -> Any:
+        return self._client("sts")
+
+    def account_id(self) -> str:
+        """Return the caller's AWS account id (cached)."""
+        if self._account_id is None:
+            self._account_id = self.sts.get_caller_identity()["Account"]
+        return self._account_id
+
+
+def error_code(err: Exception) -> str:
+    """Return the AWS error code for a ClientError, else the exception class name."""
+    if isinstance(err, ClientError):
+        return str(err.response.get("Error", {}).get("Code") or "Unknown")
+    return type(err).__name__
+
+
+def dry_run(call: Callable[..., Any], **kwargs: Any) -> str:
+    """Run call(DryRun=True, **kwargs); summarise whether AWS would allow it."""
+    try:
+        call(DryRun=True, **kwargs)
+    except ClientError as err:
+        code = error_code(err)
+        if code == "DryRunOperation":
+            return "would_succeed"
+        if code == "UnauthorizedOperation" or code.startswith("AccessDenied"):
+            return f"denied: {code}"
+        return f"error: {code}"
+    except Exception as err:  # param validation, network, etc.
+        return f"error: {error_code(err)}"
+    # AWS always answers a DryRun with an error; a normal return means it was not honoured.
+    return "error: DryRunNotHonoured"
