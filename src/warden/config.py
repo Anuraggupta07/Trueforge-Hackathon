@@ -23,6 +23,8 @@ TAG_RESTORE_IOPS = "warden:restore-iops"
 TAG_RESTORE_THROUGHPUT = "warden:restore-throughput"
 TAG_PLAN_ID = "warden:plan-id"
 TAG_RESTORED_FROM = "warden:restored-from"
+TAG_QUARANTINED_AT = "warden:quarantined-at"
+TAG_QUARANTINED_UNTIL = "warden:quarantined-until"
 DEMO_TAG = ("warden:demo", "true")
 
 _TRUE = {"1", "true", "yes", "on", "y"}
@@ -45,9 +47,17 @@ class Settings:
     plan_ttl_minutes: int = 60
     owner_lookup_limit: int = 25
     snapshot_wait_seconds: int = 600
+    quarantine_minutes: int = 10080
+    signoff_ttl_minutes: int = 10
+    scan_budget_seconds: int = 90
     state_dir: Path = REPO_ROOT / ".warden"
     host: str = "127.0.0.1"
     port: int = 8000
+    mock_endpoint: str | None = None  # WARDEN_MOCK_ENDPOINT: local moto server instead of real AWS
+
+    @property
+    def mock(self) -> bool:
+        return self.mock_endpoint is not None
 
     @property
     def scope_label(self) -> str:
@@ -132,6 +142,15 @@ def _scope(env: Mapping[str, str]) -> tuple[str | None, str | None]:
     return key, value
 
 
+def _mock_endpoint(env: Mapping[str, str]) -> str | None:
+    raw = _get(env, "WARDEN_MOCK_ENDPOINT")
+    if raw is None:
+        return None
+    if not raw.startswith(("http://", "https://")):
+        raise ValueError(f"WARDEN_MOCK_ENDPOINT must be a URL like http://127.0.0.1:5000, got {raw!r}")
+    return raw.rstrip("/")
+
+
 def load_settings(env: Mapping[str, str] | None = None) -> Settings:
     """Build Settings from env (or .env + os.environ when env is None)."""
     if env is None:
@@ -156,7 +175,11 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         plan_ttl_minutes=_int(env, "WARDEN_PLAN_TTL_MINUTES", 60, minimum=1),
         owner_lookup_limit=_int(env, "WARDEN_OWNER_LOOKUP_LIMIT", 25, minimum=0),
         snapshot_wait_seconds=_int(env, "WARDEN_SNAPSHOT_WAIT_SECONDS", 600, minimum=5),
+        quarantine_minutes=_int(env, "WARDEN_QUARANTINE_MINUTES", 10080, minimum=1),
+        signoff_ttl_minutes=_int(env, "WARDEN_SIGNOFF_TTL_MINUTES", 10, minimum=1),
+        scan_budget_seconds=_int(env, "WARDEN_SCAN_BUDGET_SECONDS", 90, minimum=10),
         state_dir=Path(state_raw).expanduser() if state_raw else REPO_ROOT / ".warden",
         host=_get(env, "WARDEN_HOST") or "127.0.0.1",
         port=_int(env, "WARDEN_PORT", 8000, minimum=1),
+        mock_endpoint=_mock_endpoint(env),
     )

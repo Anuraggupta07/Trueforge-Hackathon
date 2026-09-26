@@ -7,7 +7,7 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "boto3>=1.43.103",
+    "boto3[crt]>=1.43.103",
     "mcp>=2.2.0",
     "python-dotenv>=1.2.3",
     "trueforge-sdk>=0.2.0",
@@ -23,6 +23,6 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
-    "moto[cloudtrail,cloudwatch,ec2]>=5.2.3",
+    "moto[cloudtrail,cloudwatch,ec2,server]>=5.2.3",
     "pytest>=9.1.1",
 ]

@@ -11,7 +11,7 @@ try:  # the package is installed editable under `uv run`; fall back to src/ othe
 except ImportError:  # pragma: no cover - only when run outside the venv
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from warden.aws import _BOTO_CONFIG, AwsClients  # noqa: E402
+from warden.aws import AwsClients  # noqa: E402
 from warden.config import DEMO_TAG  # noqa: E402
 from warden.policy import tags_to_dict  # noqa: E402
 from warden.scanner import rule_covers  # noqa: E402
@@ -22,7 +22,7 @@ DEMO_FILTER = [{"Name": f"tag:{DEMO_TAG[0]}", "Values": [DEMO_TAG[1]]}]
 
 def extra_client(clients: AwsClients, service: str) -> Any:
     """A client for a service AwsClients does not expose (ssm, iam)."""
-    return clients.session.client(service, region_name=clients.settings.region, config=_BOTO_CONFIG)
+    return clients.client(service)
 
 
 def is_demo(tag_list: list[dict] | None) -> bool:

@@ -28,6 +28,7 @@ ACTIONS: dict[str, ActionSpec] = {
         ActionSpec("recycle_snapshot", "snapshot", True),
         ActionSpec("delete_snapshot", "snapshot", False),
         ActionSpec("stop_instance", "instance", True),
+        ActionSpec("quarantine_address", "address", True),
         ActionSpec("release_address", "address", False),
     )
 }

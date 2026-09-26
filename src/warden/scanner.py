@@ -4,14 +4,23 @@ from __future__ import annotations
 
 import json
 import math
+import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 from . import pricing
-from .audit import audit
+from .audit import audit, quarantine_problem, record_quarantine_void
 from .aws import AwsClients, dry_run, error_code
-from .config import TAG_BACKUP_OF, TAG_EXPIRES_AT, TAG_RECYCLE, TAG_RECYCLE_VALUE, Settings
+from .config import (
+    TAG_BACKUP_OF,
+    TAG_EXPIRES_AT,
+    TAG_QUARANTINED_UNTIL,
+    TAG_RECYCLE,
+    TAG_RECYCLE_VALUE,
+    Settings,
+)
 from .plan import ACTIONS, PlanItem, fingerprint, new_plan, save_plan
 from .policy import in_scope, keep_reasons, sanitize_tags, tags_to_dict
 
@@ -26,6 +35,13 @@ BOOT_WARMUP_MINUTES = 10
 # The README promises a 7-day undo for recycled snapshots; shorter rules do not count.
 RECYCLE_MIN_RETENTION_DAYS = 7
 _CREATE_EVENTS = ("Create", "Run", "Allocate", "Copy", "Import", "Register")
+UNTAGGED_PROD_REASON = "name suggests production but it is not tagged - a human must confirm"
+# prod/prd/production/live as a whole word; "_" and "-" count as separators (my_prod_db, prod-eu).
+_PROD_NAME = re.compile(r"(?<![A-Za-z0-9])(?:prod|prd|production|live)(?![A-Za-z0-9])", re.IGNORECASE)
+_ENV_TAG_KEYS = {"env", "environment", "stage"}
+_THROTTLE_CODES = {"Throttling", "ThrottlingException", "RequestLimitExceeded", "TooManyRequestsException"}
+_clock = time.monotonic  # patched in tests
+DECISION_LIST_MAX = 10
 
 
 # --------------------------------------------------------------------------- helpers
@@ -65,6 +81,20 @@ def _parse_time(text: str | None) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def countdown(seconds: float) -> str:
+    """Human countdown such as '6d 23h 10m' ('expired' at or below zero)."""
+    if seconds <= 0:
+        return "expired"
+    minutes = max(1, math.ceil(seconds / 60))
+    days, rest = divmod(minutes, 1440)
+    hours, mins = divmod(rest, 60)
+    parts = [f"{days}d"] if days else []
+    if days or hours:
+        parts.append(f"{hours}h")
+    parts.append(f"{mins}m")
+    return " ".join(parts)
 
 
 def _finding(
@@ -285,6 +315,107 @@ def _build_context(clients: AwsClients, instances: list[dict], notes: list[str])
     except Exception as err:
         notes.append(f"could not list all volumes ({error_code(err)})")
     return ctx
+
+
+# --------------------------------------------------------------------------- relationships (DNS, load balancers)
+
+
+def _dns_index(clients: AwsClients) -> dict[str, list[str]]:
+    """public IP -> ["<record> (<type>) in zone <zone>"] for every A/AAAA record (raises on API errors)."""
+    index: dict[str, list[str]] = {}
+    r53 = clients.route53
+    for zone in _paginate(r53, "list_hosted_zones", "HostedZones"):
+        zone_name = str(zone.get("Name") or "").rstrip(".")
+        records = _paginate(r53, "list_resource_record_sets", "ResourceRecordSets", HostedZoneId=zone["Id"])
+        for rec in records:
+            if rec.get("Type") not in ("A", "AAAA"):
+                continue
+            label = f"{str(rec.get('Name') or '').rstrip('.')} ({rec['Type']}) in zone {zone_name}"
+            for value in rec.get("ResourceRecords") or []:
+                ip = str(value.get("Value") or "").strip()
+                if ip and label not in index.setdefault(ip, []):
+                    index[ip].append(label)
+    return index
+
+
+def dns_index(clients: AwsClients, *, strict: bool = False) -> dict[str, list[str]]:
+    """Every Route 53 A/AAAA value -> records, built once ({} on any error, unless strict=True: then it raises)."""
+    try:
+        return _dns_index(clients)
+    except Exception:  # AccessDenied, throttling, network...
+        if strict:
+            raise
+        return {}
+
+
+def dns_references(clients: AwsClients, public_ip: str, *, strict: bool = False) -> list[str]:
+    """Route 53 A/AAAA records whose value is public_ip ([] on any error, unless strict=True: then it raises)."""
+    return list(dns_index(clients, strict=strict).get(str(public_ip).strip(), []))
+
+
+def _private_ip_index(clients: AwsClients) -> dict[str, str]:
+    """private IP -> instance id for every non-terminated instance (raises on API errors)."""
+    out: dict[str, str] = {}
+    for res in _paginate(clients.ec2, "describe_instances", "Reservations"):
+        for inst in res.get("Instances") or []:
+            if (inst.get("State") or {}).get("Name") == "terminated":
+                continue
+            ips = {inst.get("PrivateIpAddress")}
+            for eni in inst.get("NetworkInterfaces") or []:
+                ips.update(p.get("PrivateIpAddress") for p in eni.get("PrivateIpAddresses") or [])
+            out.update({ip: inst["InstanceId"] for ip in ips if ip})
+    return out
+
+
+def _lb_index(clients: AwsClients) -> dict[str, list[str]]:
+    """instance id -> [target group names] for instance- and ip-type target groups (raises on API errors).
+    ip-type targets are mapped to instances through their private IPs."""
+    out: dict[str, list[str]] = {}
+    by_ip: dict[str, str] | None = None
+    for tg in _paginate(clients.elbv2, "describe_target_groups", "TargetGroups"):
+        ttype = tg.get("TargetType", "instance")
+        if ttype not in ("instance", "ip"):
+            continue
+        name = tg.get("TargetGroupName") or tg.get("TargetGroupArn")
+        health = clients.elbv2.describe_target_health(TargetGroupArn=tg["TargetGroupArn"])
+        for desc in health.get("TargetHealthDescriptions") or []:
+            target = (desc.get("Target") or {}).get("Id")
+            if target and ttype == "ip":
+                if by_ip is None:
+                    by_ip = _private_ip_index(clients)
+                target = by_ip.get(target)
+            if target and name not in out.setdefault(target, []):
+                out[target].append(name)
+    return out
+
+
+def lb_target_instances(clients: AwsClients, *, strict: bool = False) -> dict[str, list[str]]:
+    """Instances registered in an ELBv2 target group ({} on any error, unless strict=True: then it raises)."""
+    try:
+        return _lb_index(clients)
+    except Exception:
+        if strict:
+            raise
+        return {}
+
+
+def _has_env_tag(tags: dict[str, str]) -> bool:
+    return any(str(k).strip().lower() in _ENV_TAG_KEYS and str(v).strip() for k, v in tags.items())
+
+
+def _prod_guard(finding: dict | None, raw: dict) -> dict | None:
+    """Untagged-production heuristic: a production-looking Name (or snapshot Description) with no env tag
+    turns act/review into review. Never overrides a keep."""
+    if finding is None or finding["verdict"] == "keep":
+        return finding
+    tags = tags_to_dict(raw.get("Tags"))
+    if _has_env_tag(tags):
+        return finding
+    texts = [tags.get("Name") or "", str(raw.get("Description") or "")]
+    if not any(_PROD_NAME.search(t) for t in texts):
+        return finding
+    reasons = [UNTAGGED_PROD_REASON] + [r for r in finding["reasons"] if r != UNTAGGED_PROD_REASON]
+    return _set_verdict(finding, "review", reasons)
 
 
 # --------------------------------------------------------------------------- volumes
@@ -518,7 +649,10 @@ def _stop_protected(clients: AwsClients, instance_id: str) -> bool:
     return bool((resp.get("DisableApiStop") or {}).get("Value"))
 
 
-def _instance_finding(clients: AwsClients, inst: dict, settings: Settings, now: datetime) -> dict | None:
+def _instance_finding(
+    clients: AwsClients, inst: dict, settings: Settings, now: datetime,
+    lb_targets: dict[str, list[str]] | None = None,
+) -> dict | None:
     tags = tags_to_dict(inst.get("Tags"))
     if not in_scope(tags, settings):
         return None
@@ -535,6 +669,12 @@ def _instance_finding(clients: AwsClients, inst: dict, settings: Settings, now: 
     reasons = keep_reasons(tags)
     if reasons:
         return _set_verdict(f, "keep", reasons)
+    groups = (lb_targets or {}).get(iid) or []
+    if groups:
+        f["evidence"]["references"].extend(f"{iid} <- load balancer target group {g}" for g in groups)
+        return _set_verdict(
+            f, "keep", [f"serving traffic via load balancer target group {', '.join(groups)}"]
+        )
     if inst.get("InstanceLifecycle") == "spot":
         return _set_verdict(f, "keep", ["spot instance: stopping may lose capacity/request"])
     if inst.get("RootDeviceType") == "instance-store":
@@ -562,20 +702,64 @@ def _instance_finding(clients: AwsClients, inst: dict, settings: Settings, now: 
 # --------------------------------------------------------------------------- addresses
 
 
-def _address_finding(addr: dict, settings: Settings, now: datetime) -> dict | None:
+def _address_finding(
+    addr: dict, settings: Settings, now: datetime, dns: dict[str, list[str]] | None = None,
+    dns_checked: bool = True,
+) -> dict | None:
+    """Unassociated Elastic IPs: quarantine first (reversible), release only after the window."""
     tags = tags_to_dict(addr.get("Tags"))
-    if addr.get("AssociationId") or not addr.get("AllocationId") or not in_scope(tags, settings):
+    if not addr.get("AllocationId") or not in_scope(tags, settings):
         return None
-    f = _finding("address", addr["AllocationId"], addr, tags, settings, now, state="unassociated")
+    if addr.get("AssociationId") or addr.get("InstanceId") or addr.get("NetworkInterfaceId"):
+        if TAG_QUARANTINED_UNTIL in tags:  # someone still needs it: this quarantine can never justify a release
+            record_quarantine_void(settings, addr["AllocationId"], tags, "seen associated by a scan")
+        return None
+    until_text = tags.get(TAG_QUARANTINED_UNTIL)
+    state = "quarantined" if until_text is not None else "unassociated"
+    f = _finding("address", addr["AllocationId"], addr, tags, settings, now, state=state)
     f["est_monthly_usd"] = pricing.address_monthly_usd(settings.region)
-    f["evidence"]["references"].append(f"public IP {addr.get('PublicIp')}")
-    f["warnings"].append(
-        "Irreversible: this public IP cannot be guaranteed back; check DNS records and partner allow-lists first"
-    )
+    ip = addr.get("PublicIp")
+    f["evidence"]["references"].append(f"public IP {ip}")
     reasons = keep_reasons(tags)
     if reasons:
         return _set_verdict(f, "keep", reasons)
-    return _set_verdict(f, "act", [f"Elastic IP {addr.get('PublicIp')} is not associated with anything"], "release_address")
+    records = (dns or {}).get(str(ip or "").strip(), [])
+    if records:
+        f["evidence"]["references"].extend(f"DNS {r} -> {ip}" for r in records)
+        return _set_verdict(
+            f, "keep",
+            [f"DNS record {', '.join(records)} points at this IP - releasing would leave a dangling record "
+             "(subdomain takeover risk)"],
+        )
+    if not dns_checked:
+        return _set_verdict(f, "review", ["could not read Route 53 records, so DNS references to this IP are unknown"])
+    if until_text is None:
+        return _set_verdict(
+            f, "act",
+            [f"Elastic IP {ip} is not associated with anything; quarantine it first (tag only, reversible)"],
+            "quarantine_address",
+        )
+    until = _parse_time(until_text)
+    if until is None:
+        return _set_verdict(f, "review", [f"invalid {TAG_QUARANTINED_UNTIL} tag {until_text!r}"])
+    if until > now:
+        return _set_verdict(
+            f, "keep", [f"in quarantine - releasable in {countdown((until - now).total_seconds())}"]
+        )
+    problem = quarantine_problem(settings, addr["AllocationId"], tags)
+    if problem:
+        return _set_verdict(
+            f, "act", [f"{problem}; quarantine it again for a fresh window (tag only, reversible)"],
+            "quarantine_address",
+        )
+    f["warnings"].append(
+        "Irreversible: this public IP cannot be guaranteed back; check partner allow-lists first (one id per call)"
+    )
+    return _set_verdict(
+        f, "act",
+        [f"Elastic IP {ip} finished its quarantine ({_iso(until)}) and is still not associated with anything"],
+        "release_address",
+    )
 
 
 # --------------------------------------------------------------------------- enrichment
@@ -600,6 +784,9 @@ def _dry_run_call(clients: AwsClients, finding: dict) -> str:
         return dry_run(ec2.delete_snapshot, SnapshotId=rid)
     if action == "stop_instance":
         return dry_run(ec2.stop_instances, InstanceIds=[rid])
+    if action == "quarantine_address":
+        probe = [{"Key": TAG_QUARANTINED_UNTIL, "Value": _iso(datetime.now(timezone.utc)) or ""}]
+        return dry_run(ec2.create_tags, Resources=[rid], Tags=probe)
     if action == "release_address":
         return dry_run(ec2.release_address, AllocationId=rid)
     return "not run"
@@ -623,7 +810,8 @@ def _lookup_owner(clients: AwsClients, resource_id: str) -> dict:
             LookupAttributes=[{"AttributeKey": "ResourceName", "AttributeValue": resource_id}], MaxResults=5
         )
     except Exception as err:
-        return {"created_by": None, "note": f"owner lookup unavailable ({error_code(err)})"}
+        return {"created_by": None, "note": f"owner lookup unavailable ({error_code(err)})",
+                "_code": error_code(err)}
     events = resp.get("Events") or []
     if not events:
         return {"created_by": None, "note": NO_OWNER_NOTE}
@@ -638,20 +826,120 @@ def _lookup_owner(clients: AwsClients, resource_id: str) -> dict:
     return {"created_by": who, "event": event.get("EventName"), "event_time": _iso(event.get("EventTime"))}
 
 
-def _apply_owners(clients: AwsClients, findings: list[dict], settings: Settings) -> None:
+def _apply_owners(clients: AwsClients, findings: list[dict], settings: Settings, started: float) -> None:
+    """CloudTrail creator per target, within the scan's time budget (owner lookups get half of it).
+    A non-throttling failure (not implemented, access denied, 5xx...) stops further lookups for this scan."""
     cache: dict[str, dict] = {}
+    skipped: dict | None = None
     order = [f for f in findings if f["verdict"] == "act"] + [f for f in findings if f["verdict"] == "review"]
     for f in order:
         rid = f["resource_id"]
         if rid not in cache:
             if len(cache) >= settings.owner_lookup_limit:
                 break
-            cache[rid] = _lookup_owner(clients, rid)
+            if skipped is None and _clock() - started > settings.scan_budget_seconds / 2:
+                skipped = {"created_by": None, "note": "owner lookup skipped (time budget)"}
+            if skipped is not None:
+                cache[rid] = skipped
+            else:
+                owner = _lookup_owner(clients, rid)
+                code = owner.pop("_code", None)
+                if code is not None and code not in _THROTTLE_CODES:
+                    skipped = {"created_by": None, "note": f"owner lookup skipped (CloudTrail unavailable: {code})"}
+                cache[rid] = owner
         f["evidence"]["owner"] = cache[rid]
+
+
+def _tier(finding: dict) -> str:
+    if finding["verdict"] == "keep":
+        return "protected"
+    if finding["verdict"] == "act" and finding["reversible"]:
+        return "safe_reversible"
+    return "needs_review"
+
+
+def _age_phrase(finding: dict) -> str:
+    age = finding.get("age_days")
+    if age is None:
+        return ""
+    if age < 1:
+        return " less than a day ago"
+    days = int(age)
+    return f" {days} day{'s' if days != 1 else ''} ago"
+
+
+def _why_act(finding: dict, settings: Settings) -> str:
+    action = finding["action"]
+    if action == "quarantine_volume":
+        return (f"Created{_age_phrase(finding)}, attached to nothing and nothing references it; Warden will back "
+                "it up first so you can restore it in one click.")
+    if action == "recycle_snapshot":
+        what = ("Warden's own backup whose restore window has ended" if finding["tags"].get(TAG_BACKUP_OF)
+                else "A snapshot of a disk that no longer exists and no image uses it")
+        return f"{what}; it goes to the Recycle Bin, so you can still restore it for 7 days."
+    if action == "delete_snapshot":
+        return ("Nothing uses this snapshot, but there is no Recycle Bin safety net, so deleting it is permanent "
+                "and it needs its own approval.")
+    if action == "stop_instance":
+        return ("It has barely used any CPU or network lately; stopping keeps its disks and you can start it "
+                "again in one click.")
+    if action == "quarantine_address":
+        return (f"This public IP is attached to nothing and no DNS record points at it; Warden only marks it for a "
+                f"{countdown(settings.quarantine_minutes * 60)} quarantine first and releases nothing yet.")
+    if action == "release_address":
+        return ("Its quarantine is over and it is still unused with no DNS record pointing at it; releasing is "
+                "permanent because the same IP cannot be guaranteed back.")
+    return "Warden found nothing that uses it."
+
+
+def _why_review(finding: dict) -> str:
+    reasons = finding["reasons"]
+    if UNTAGGED_PROD_REASON in reasons:
+        return ("Its name suggests production but it has no environment tag, so a human must confirm before "
+                "anything happens.")
+    if any(r.startswith("AWS dry run") for r in reasons):
+        return "AWS did not confirm a dry run of the cleanup, so Warden will not act until a human checks access."
+    if NO_METRICS_REASON in reasons:
+        return "There is no usage data for it yet, so Warden cannot tell whether it is idle."
+    first = reasons[0] if reasons else "no clear evidence either way"
+    return f"Warden cannot judge this safely on its own ({first}), so a human should decide."
+
+
+def _why_keep(finding: dict) -> str:
+    first = finding["reasons"][0] if finding["reasons"] else "no reason to act"
+    if first.startswith("active:"):
+        return "It is in active use, so Warden leaves it alone."
+    if first.startswith("used by AMI"):
+        return "A machine image (AMI) is built from this snapshot, so deleting it would break future launches."
+    if first.startswith("protected: "):
+        first = first[len("protected: "):]
+    return f"Warden will not touch it: {first}."
+
+
+def _apply_tiers(findings: list[dict], settings: Settings) -> None:
+    """Add the human-facing tier and a one-sentence why to every finding."""
+    for f in findings:
+        f["tier"] = _tier(f)
+        if f["verdict"] == "keep":
+            f["why"] = _why_keep(f)
+        elif f["verdict"] == "act":
+            f["why"] = _why_act(f, settings)
+        else:
+            f["why"] = _why_review(f)
+
+
+def _decision_list(findings: list[dict]) -> list[str]:
+    """Up to DECISION_LIST_MAX ids: needs_review first, then safe_reversible, each by monthly cost desc."""
+    def ordered(tier: str) -> list[dict]:
+        group = [f for f in findings if _tier(f) == tier]
+        return sorted(group, key=lambda f: f["est_monthly_usd"] or 0.0, reverse=True)
+
+    return [f["resource_id"] for f in ordered("needs_review") + ordered("safe_reversible")][:DECISION_LIST_MAX]
 
 
 def _summary(findings: list[dict]) -> dict:
     acts = [f for f in findings if f["verdict"] == "act"]
+    tiers = [_tier(f) for f in findings]
     return {
         "act": len(acts),
         "keep": sum(f["verdict"] == "keep" for f in findings),
@@ -659,6 +947,8 @@ def _summary(findings: list[dict]) -> dict:
         "reversible_actions": sum(bool(f["reversible"]) for f in acts),
         "irreversible_actions": sum(f["reversible"] is False for f in acts),
         "est_monthly_savings_usd": round(sum(f["est_monthly_usd"] or 0.0 for f in acts), 2),
+        "tiers": {t: tiers.count(t) for t in ("safe_reversible", "needs_review", "protected")},
+        "decision_list": _decision_list(findings),
     }
 
 
@@ -692,6 +982,7 @@ def scan(clients: AwsClients, settings: Settings, now: datetime | None = None) -
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
+    started = _clock()
     notes: list[str] = [f"prices are {pricing.PRICING_NOTE}"]
     account_id = clients.account_id()
     rules = recycle_rules(clients)
@@ -708,22 +999,47 @@ def scan(clients: AwsClients, settings: Settings, now: datetime | None = None) -
 
     volumes = _list("volumes", lambda: _paginate(
         ec2, "describe_volumes", "Volumes", Filters=[{"Name": "status", "Values": ["available"]}]), notes)
-    _evaluate("volume", volumes, "VolumeId", lambda v: _volume_finding(v, settings, ctx, now), findings, notes)
+    _evaluate(
+        "volume", volumes, "VolumeId", lambda v: _prod_guard(_volume_finding(v, settings, ctx, now), v),
+        findings, notes,
+    )
 
     snapshots = _list("snapshots", lambda: _paginate(ec2, "describe_snapshots", "Snapshots", OwnerIds=["self"]), notes)
     _evaluate(
         "snapshot", snapshots, "SnapshotId",
-        lambda s: _snapshot_finding(clients, s, settings, ctx, now, rules), findings, notes,
+        lambda s: _prod_guard(_snapshot_finding(clients, s, settings, ctx, now, rules), s), findings, notes,
     )
 
     running = [i for i in all_instances if (i.get("State") or {}).get("Name") == "running"]
-    _evaluate("instance", running, "InstanceId", lambda i: _instance_finding(clients, i, settings, now), findings, notes)
+    lb_targets: dict[str, list[str]] = {}
+    if running:
+        try:
+            lb_targets = _lb_index(clients)
+        except Exception as err:
+            notes.append(f"load balancer target groups unavailable ({error_code(err)}); "
+                         "instances behind a load balancer may be misjudged")
+    _evaluate(
+        "instance", running, "InstanceId",
+        lambda i: _prod_guard(_instance_finding(clients, i, settings, now, lb_targets), i), findings, notes,
+    )
 
     addresses = _list("addresses", lambda: _paginate(ec2, "describe_addresses", "Addresses"), notes)
-    _evaluate("address", addresses, "AllocationId", lambda a: _address_finding(a, settings, now), findings, notes)
+    dns: dict[str, list[str]] = {}
+    dns_checked = True
+    if any(not a.get("AssociationId") for a in addresses):
+        try:
+            dns = _dns_index(clients)
+        except Exception as err:
+            dns_checked = False
+            notes.append(f"Route 53 records unavailable ({error_code(err)}); unused Elastic IPs held for review")
+    _evaluate(
+        "address", addresses, "AllocationId",
+        lambda a: _prod_guard(_address_finding(a, settings, now, dns, dns_checked), a), findings, notes,
+    )
 
     _apply_dry_runs(clients, findings)
-    _apply_owners(clients, findings, settings)
+    _apply_owners(clients, findings, settings, started)
+    _apply_tiers(findings, settings)
 
     items = [
         PlanItem(f["resource_id"], f["resource_type"], f["verdict"], f["action"], f["fingerprint"])
@@ -732,8 +1048,15 @@ def scan(clients: AwsClients, settings: Settings, now: datetime | None = None) -
     plan = new_plan(account_id, settings.region, items, settings)
     save_plan(plan, settings)
     summary = _summary(findings)
+    # One compact row per finding, so resource_history can answer "was X scanned, and what was decided?".
+    results = [
+        {"resource_id": f["resource_id"], "resource_type": f["resource_type"], "name": f["name"],
+         "verdict": f["verdict"], "tier": f["tier"], "action": f["action"],
+         "reason": f["reasons"][0] if f["reasons"] else None}
+        for f in findings
+    ]
     audit(settings, "scan", plan_id=plan.plan_id, account_id=account_id, region=settings.region,
-          scope=settings.scope_label, summary=summary)
+          scope=settings.scope_label, summary=summary, results=results)
     return {
         "plan_id": plan.plan_id,
         "account_id": account_id,

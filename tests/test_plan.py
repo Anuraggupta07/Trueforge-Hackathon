@@ -104,6 +104,7 @@ def test_actions_table():
         "recycle_snapshot": ("snapshot", True),
         "delete_snapshot": ("snapshot", False),
         "stop_instance": ("instance", True),
+        "quarantine_address": ("address", True),
         "release_address": ("address", False),
     }
 

@@ -9,8 +9,8 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from botocore.exceptions import ClientError
 
-from warden import scanner
-from warden.config import TAG_BACKUP_OF, TAG_EXPIRES_AT, load_settings
+from warden import audit, scanner
+from warden.config import TAG_BACKUP_OF, TAG_EXPIRES_AT, TAG_QUARANTINED_AT, TAG_QUARANTINED_UNTIL, load_settings
 from warden.plan import load_plan
 from warden.policy import INJECTION_REASON
 
@@ -200,8 +200,9 @@ def test_full_world_verdicts(aws, scoped, world, monkeypatch):
     assert "active" in f[world["busy_i"]]["reasons"][0]
 
     eip = f[world["free_eip"]]
-    assert (eip["verdict"], eip["action"], eip["reversible"]) == ("act", "release_address", False)
-    assert any("Irreversible" in w for w in eip["warnings"])
+    assert (eip["verdict"], eip["action"], eip["reversible"]) == ("act", "quarantine_address", True)
+    assert eip["state"] == "unassociated" and eip["evidence"]["dry_run"] == "would_succeed"
+    assert not any("Irreversible" in w for w in eip["warnings"])
     assert world["used_eip"] not in f
 
     # plan saved with every finding
@@ -216,7 +217,7 @@ def test_full_world_verdicts(aws, scoped, world, monkeypatch):
     assert s["act"] == len(acts) == 7  # incl. the still-existing source volume of kept_source_snap
     assert s["keep"] == sum(x["verdict"] == "keep" for x in report["findings"])
     assert s["review"] == 1
-    assert s["irreversible_actions"] == 1 and s["reversible_actions"] == 6
+    assert s["irreversible_actions"] == 0 and s["reversible_actions"] == 7
     assert s["est_monthly_savings_usd"] == round(sum(x["est_monthly_usd"] or 0 for x in acts), 2)
     json.dumps(report)  # JSON-serialisable
 
@@ -231,7 +232,7 @@ def test_snapshots_delete_when_recycle_bin_missing(aws, scoped, world, monkeypat
     orphan = f[world["orphan_snap"]]
     assert (orphan["action"], orphan["reversible"]) == ("delete_snapshot", False)
     assert any("Recycle Bin" in n for n in report["notes"])
-    assert report["summary"]["irreversible_actions"] == 3  # 2 snapshots + 1 EIP
+    assert report["summary"]["irreversible_actions"] == 2  # 2 snapshots (the EIP is only quarantined)
 
 
 def test_unscoped_includes_untagged(aws, settings, world, monkeypatch):
@@ -456,3 +457,353 @@ def test_encrypted_volume_warns_about_kms_restore(settings):  # S11
            "Encrypted": True, "KmsKeyId": "arn:aws:kms:us-east-1:123456789012:key/abc"}
     f = scanner._volume_finding(vol, settings, scanner._Context(), datetime.now(timezone.utc))
     assert any("KMS" in w and "key/abc" in w for w in f["warnings"])
+
+
+# ---------------------------------------------------------------- v1.1 trust layer
+
+
+def _zone_with_a_record(aws, record: str, ip: str, zone: str = "example.com") -> None:
+    r53 = aws.route53
+    zid = r53.create_hosted_zone(Name=zone, CallerReference=f"{zone}-{record}")["HostedZone"]["Id"]
+    r53.change_resource_record_sets(HostedZoneId=zid, ChangeBatch={"Changes": [{
+        "Action": "CREATE",
+        "ResourceRecordSet": {"Name": record, "Type": "A", "TTL": 60, "ResourceRecords": [{"Value": ip}]},
+    }]})
+
+
+def _target_group(aws, name: str, instance_ids: list[str]) -> None:
+    vpc = aws.ec2.describe_vpcs()["Vpcs"][0]["VpcId"]
+    arn = aws.elbv2.create_target_group(
+        Name=name, Protocol="HTTP", Port=80, VpcId=vpc, TargetType="instance"
+    )["TargetGroups"][0]["TargetGroupArn"]
+    aws.elbv2.register_targets(TargetGroupArn=arn, Targets=[{"Id": i} for i in instance_ids])
+
+
+def _eip(aws, **tags: str) -> tuple[str, str]:
+    resp = aws.ec2.allocate_address(
+        Domain="vpc", TagSpecifications=[{"ResourceType": "elastic-ip", "Tags": _tags(**tags)}]
+    )
+    return resp["AllocationId"], resp["PublicIp"]
+
+
+def _raise(code: str):
+    def boom(*args, **kwargs):
+        raise ClientError({"Error": {"Code": code, "Message": "x"}}, "Op")
+    return boom
+
+
+def _break(monkeypatch, client, method: str) -> None:
+    monkeypatch.setattr(client, method, _raise("AccessDenied"))
+    monkeypatch.setattr(client, "can_paginate", lambda name: False)
+
+
+def test_dns_references_finds_a_records(aws):
+    _zone_with_a_record(aws, "app.example.com", "203.0.113.7")
+    _zone_with_a_record(aws, "other.example.org", "203.0.113.8", zone="example.org")
+    assert scanner.dns_references(aws, "203.0.113.7") == ["app.example.com (A) in zone example.com"]
+    assert scanner.dns_references(aws, "198.51.100.1") == []
+
+
+def test_dns_references_errors_return_empty(aws, monkeypatch):
+    _break(monkeypatch, aws.route53, "list_hosted_zones")
+    assert scanner.dns_references(aws, "203.0.113.7") == []
+
+
+def test_lb_target_instances(aws):
+    ami = _any_ami(aws.ec2)
+    web = _instance(aws.ec2, ami, _tags(Name="web"))
+    other = _instance(aws.ec2, ami, _tags(Name="other"))
+    _target_group(aws, "web-tg", [web])
+    _target_group(aws, "web-tg-2", [web])
+    out = scanner.lb_target_instances(aws)
+    assert sorted(out[web]) == ["web-tg", "web-tg-2"]
+    assert other not in out
+
+
+def test_lb_target_instances_errors_return_empty(aws, monkeypatch):
+    _break(monkeypatch, aws.elbv2, "describe_target_groups")
+    assert scanner.lb_target_instances(aws) == {}
+
+
+def test_strict_helpers_raise_so_the_watchdog_can_fail_closed(aws, monkeypatch):
+    _break(monkeypatch, aws.route53, "list_hosted_zones")
+    _break(monkeypatch, aws.elbv2, "describe_target_groups")
+    with pytest.raises(Exception):
+        scanner.dns_references(aws, "203.0.113.7", strict=True)
+    with pytest.raises(Exception):
+        scanner.lb_target_instances(aws, strict=True)
+
+
+def test_instance_in_target_group_is_kept(aws, scoped, world, monkeypatch):
+    _rb(monkeypatch, True)
+    _target_group(aws, "web-tg", [world["idle_i"]])
+    f = _by_id(scanner.scan(aws, scoped, now=datetime.now(timezone.utc) + SCAN_AHEAD))[world["idle_i"]]
+    assert f["verdict"] == "keep" and f["tier"] == "protected"
+    assert f["reasons"] == ["serving traffic via load balancer target group web-tg"]
+    assert any("web-tg" in r for r in f["evidence"]["references"])
+
+
+def test_lb_unavailable_is_noted(aws, scoped, world, monkeypatch):
+    _rb(monkeypatch, True)
+    _break(monkeypatch, aws.elbv2, "describe_target_groups")
+    report = scanner.scan(aws, scoped)
+    assert any("load balancer" in n and "AccessDenied" in n for n in report["notes"])
+
+
+def test_eip_with_dns_record_is_kept(aws, scoped, world, monkeypatch):
+    _rb(monkeypatch, True)
+    _zone_with_a_record(aws, "shop.example.com", world["free_ip"])
+    eip = _by_id(scanner.scan(aws, scoped))[world["free_eip"]]
+    assert eip["verdict"] == "keep" and eip["tier"] == "protected"
+    reason = eip["reasons"][0]
+    assert reason.startswith("DNS record shop.example.com (A) in zone example.com points at this IP")
+    assert "subdomain takeover risk" in reason
+
+
+def test_eip_in_quarantine_is_kept_with_countdown(aws, scoped, monkeypatch):
+    _rb(monkeypatch, True)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    until = (now + timedelta(days=6, hours=23, minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    alloc, _ = _eip(aws, **{TAG_QUARANTINED_UNTIL: until})
+    eip = _by_id(scanner.scan(aws, scoped, now=now))[alloc]
+    assert eip["verdict"] == "keep" and eip["state"] == "quarantined"
+    assert eip["reasons"] == ["in quarantine - releasable in 6d 23h 10m"]
+
+
+def _warden_quarantine(aws, settings, alloc: str, until: str, at: str = "2020-01-01T00:00:00Z") -> None:
+    """Tag the address as Warden does and write the matching quarantine receipt."""
+    aws.ec2.create_tags(Resources=[alloc], Tags=[{"Key": TAG_QUARANTINED_AT, "Value": at},
+                                                 {"Key": TAG_QUARANTINED_UNTIL, "Value": until}])
+    audit.save_receipt(settings, {
+        "receipt_id": audit.new_id("rcpt"), "action": "quarantine_address", "plan_id": "plan-x", "finished_at": at,
+        "results": [{"resource_id": alloc, "status": "done", "quarantined_at": at, "quarantined_until": until}],
+    })
+
+
+def test_eip_after_quarantine_is_irreversible_release(aws, scoped, monkeypatch):
+    _rb(monkeypatch, True)
+    now = datetime.now(timezone.utc)
+    past = (now - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    alloc, _ = _eip(aws)
+    _warden_quarantine(aws, scoped, alloc, past)
+    report = scanner.scan(aws, scoped, now=now)
+    eip = _by_id(report)[alloc]
+    assert (eip["verdict"], eip["action"], eip["reversible"]) == ("act", "release_address", False)
+    assert eip["tier"] == "needs_review"
+    assert any("Irreversible" in w for w in eip["warnings"])
+    assert eip["evidence"]["dry_run"] == "would_succeed"
+    assert report["summary"]["irreversible_actions"] == 1
+
+
+def test_eip_invalid_quarantine_tag_is_review(aws, scoped, monkeypatch):
+    _rb(monkeypatch, True)
+    alloc, _ = _eip(aws, **{TAG_QUARANTINED_UNTIL: "soon"})
+    eip = _by_id(scanner.scan(aws, scoped))[alloc]
+    assert eip["verdict"] == "review"
+
+
+def test_eip_held_for_review_when_route53_unavailable(aws, scoped, world, monkeypatch):
+    _rb(monkeypatch, True)
+    _break(monkeypatch, aws.route53, "list_hosted_zones")
+    report = scanner.scan(aws, scoped)
+    eip = _by_id(report)[world["free_eip"]]
+    assert eip["verdict"] == "review" and eip["action"] is None
+    assert any("Route 53" in n for n in report["notes"])
+
+
+@pytest.mark.parametrize(
+    "name, extra, verdict",
+    [
+        ("prod-db", {}, "review"),
+        ("PRD_cache", {}, "review"),
+        ("my live data", {}, "review"),
+        ("Production", {}, "review"),
+        ("prod-db", {"env": "dev"}, "act"),
+        ("prod-db", {"env": "production"}, "keep"),  # policy keep wins
+        ("productivity-scratch", {}, "act"),
+        ("delivery-logs", {}, "act"),
+    ],
+)
+def test_untagged_production_name_needs_review(aws, scoped, monkeypatch, name, extra, verdict):
+    _rb(monkeypatch, True)
+    vid = _volume(aws.ec2, _tags(Name=name, **extra))
+    f = _by_id(scanner.scan(aws, scoped))[vid]
+    assert f["verdict"] == verdict
+    if verdict == "review":
+        assert f["reasons"][0] == scanner.UNTAGGED_PROD_REASON
+        assert f["tier"] == "needs_review"
+        assert "production" in f["why"]
+
+
+def test_untagged_production_snapshot_description(aws, scoped, monkeypatch):
+    _rb(monkeypatch, True)
+    vol = _volume(aws.ec2, DEMO, size=8)
+    sid = aws.ec2.create_snapshot(
+        VolumeId=vol, Description="nightly copy of the production database",
+        TagSpecifications=[{"ResourceType": "snapshot", "Tags": DEMO}],
+    )["SnapshotId"]
+    aws.ec2.delete_volume(VolumeId=vol)
+    f = _by_id(scanner.scan(aws, scoped))[sid]
+    assert f["verdict"] == "review" and f["reasons"][0] == scanner.UNTAGGED_PROD_REASON
+
+
+def test_untagged_production_eip_and_instance(aws, scoped, monkeypatch):
+    _rb(monkeypatch, True)
+    alloc, _ = _eip(aws, Name="prod-api")
+    iid = _instance(aws.ec2, _any_ami(aws.ec2), _tags(Name="live-worker"))
+    f = _by_id(scanner.scan(aws, scoped))
+    assert f[alloc]["verdict"] == "review" and f[alloc]["action"] is None
+    assert f[iid]["verdict"] == "review" and f[iid]["reasons"][0] == scanner.UNTAGGED_PROD_REASON
+
+
+def test_tiers_why_and_decision_list(aws, scoped, world, monkeypatch):
+    _rb(monkeypatch, True)
+    report = scanner.scan(aws, scoped, now=datetime.now(timezone.utc) + SCAN_AHEAD)
+    f = _by_id(report)
+    assert f[world["plain_vol"]]["tier"] == "safe_reversible"
+    assert f[world["prod_vol"]]["tier"] == "protected"
+    assert f[world["quiet_i"]]["tier"] == "needs_review"
+    assert f[world["free_eip"]]["tier"] == "safe_reversible"
+    for x in report["findings"]:
+        assert x["tier"] in ("safe_reversible", "needs_review", "protected")
+        assert x["why"] and x["why"].endswith(".") and "\n" not in x["why"]
+    assert "back it up first" in f[world["plain_vol"]]["why"]
+    assert "quarantine" in f[world["free_eip"]]["why"]
+    assert "active use" in f[world["busy_i"]]["why"]
+    assert "%" not in f[world["idle_i"]]["why"]  # plain English, no metric dump
+
+    tiers = report["summary"]["tiers"]
+    assert sum(tiers.values()) == len(report["findings"])
+    assert tiers["needs_review"] == report["summary"]["review"] + report["summary"]["irreversible_actions"]
+    decision = report["summary"]["decision_list"]
+    assert 0 < len(decision) <= 10
+    kinds = [f[i]["tier"] for i in decision]
+    assert kinds == sorted(kinds, key=lambda t: t != "needs_review")  # needs_review first
+    assert "protected" not in kinds
+    safe = [f[i]["est_monthly_usd"] or 0 for i in decision if f[i]["tier"] == "safe_reversible"]
+    assert safe == sorted(safe, reverse=True)
+
+
+def test_decision_list_caps_at_ten():
+    findings = [
+        {"resource_id": f"vol-{i}", "verdict": "act", "reversible": True, "est_monthly_usd": float(i)}
+        for i in range(12)
+    ] + [{"resource_id": "vol-r", "verdict": "review", "reversible": None, "est_monthly_usd": 0.1}]
+    out = scanner._decision_list(findings)
+    assert len(out) == 10 and out[0] == "vol-r" and out[1] == "vol-11"
+
+
+@pytest.mark.parametrize(
+    "seconds, text",
+    [(0, "expired"), (-5, "expired"), (30, "1m"), (65 * 60, "1h 5m"),
+     (6 * 86400 + 23 * 3600 + 10 * 60, "6d 23h 10m"), (7 * 86400, "7d 0h 0m")],
+)
+def test_countdown(seconds, text):
+    assert scanner.countdown(seconds) == text
+
+
+# ---------------------------------------------------------------- review fixes
+
+
+def test_eip_quarantine_tag_without_warden_receipt_is_requarantined(aws, scoped, monkeypatch):  # bypass F1
+    _rb(monkeypatch, True)
+    now = datetime.now(timezone.utc)
+    past = (now - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    alloc, _ = _eip(aws, **{TAG_QUARANTINED_AT: "2020-01-01T00:00:00Z", TAG_QUARANTINED_UNTIL: past})
+    eip = _by_id(scanner.scan(aws, scoped, now=now))[alloc]
+    assert (eip["verdict"], eip["action"], eip["reversible"]) == ("act", "quarantine_address", True)
+    assert "not set by Warden" in eip["reasons"][0]
+
+
+def test_eip_used_during_quarantine_is_requarantined_not_released(aws, scoped, monkeypatch):  # F1 / demo F2
+    _rb(monkeypatch, True)
+    now = datetime.now(timezone.utc)
+    future = (now + timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    alloc, _ = _eip(aws)
+    _warden_quarantine(aws, scoped, alloc, future)
+    iid = _instance(aws.ec2, _any_ami(aws.ec2), _tags(Name="web"))
+    assoc = aws.ec2.associate_address(AllocationId=alloc, InstanceId=iid)["AssociationId"]
+    scanner.scan(aws, scoped, now=now)  # Warden sees it in use during the window
+    assert any(e["event"] == "quarantine_void" for e in audit.history(scoped, alloc))
+    aws.ec2.disassociate_address(AssociationId=assoc)
+    past = (now - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    aws.ec2.create_tags(Resources=[alloc], Tags=[{"Key": TAG_QUARANTINED_UNTIL, "Value": past}])
+    eip = _by_id(scanner.scan(aws, scoped, now=now))[alloc]
+    assert (eip["verdict"], eip["action"]) == ("act", "quarantine_address")
+    assert "void" in eip["reasons"][0]
+
+
+def test_scan_ledger_records_every_verdict(aws, scoped, world, monkeypatch):  # bypass F3 / demo F1
+    _rb(monkeypatch, True)
+    report = scanner.scan(aws, scoped)
+    (entry,) = audit.history(scoped, world["prod_vol"])
+    assert entry["event"] == "scan" and entry["plan_id"] == report["plan_id"]
+    (row,) = entry["results"]
+    assert row["resource_id"] == world["prod_vol"] and row["verdict"] == "keep" and row["tier"] == "protected"
+    assert "production" in row["reason"].lower()
+    (plain,) = audit.history(scoped, world["plain_vol"])[0]["results"]
+    assert (plain["verdict"], plain["action"], plain["name"]) == ("act", "quarantine_volume", "scratch-disk")
+
+
+def test_instance_in_ip_target_group_is_kept(aws, scoped, world, monkeypatch):  # bypass F5
+    _rb(monkeypatch, True)
+    inst = aws.ec2.describe_instances(InstanceIds=[world["idle_i"]])["Reservations"][0]["Instances"][0]
+    vpc = aws.ec2.describe_vpcs()["Vpcs"][0]["VpcId"]
+    arn = aws.elbv2.create_target_group(
+        Name="ip-tg", Protocol="HTTP", Port=80, VpcId=vpc, TargetType="ip"
+    )["TargetGroups"][0]["TargetGroupArn"]
+    aws.elbv2.register_targets(TargetGroupArn=arn, Targets=[{"Id": inst["PrivateIpAddress"]}])
+    assert scanner.lb_target_instances(aws) == {world["idle_i"]: ["ip-tg"]}
+    f = _by_id(scanner.scan(aws, scoped, now=datetime.now(timezone.utc) + SCAN_AHEAD))[world["idle_i"]]
+    assert f["verdict"] == "keep" and f["reasons"] == ["serving traffic via load balancer target group ip-tg"]
+
+
+def _several_act_volumes(aws, n: int = 4) -> list[str]:
+    return [_volume(aws.ec2, _tags(Name=f"scratch-{i}")) for i in range(n)]
+
+
+def test_owner_lookup_stops_after_first_hard_failure(aws, scoped, monkeypatch):  # LEAD-1
+    _rb(monkeypatch, True)
+    _several_act_volumes(aws)
+    calls: list[str] = []
+
+    def broken(**kwargs):
+        calls.append(kwargs["LookupAttributes"][0]["AttributeValue"])
+        raise ClientError({"Error": {"Code": "InternalFailure", "Message": "x"}}, "LookupEvents")
+
+    monkeypatch.setattr(aws.cloudtrail, "lookup_events", broken)
+    report = scanner.scan(aws, scoped)
+    assert len(calls) == 1
+    owners = [f["evidence"]["owner"] for f in report["findings"] if f["evidence"]["owner"]]
+    assert len(owners) >= 4 and all(o["created_by"] is None and o["note"] for o in owners)
+    assert any("skipped" in o["note"] for o in owners)
+
+
+def test_owner_lookup_keeps_going_after_throttling_but_respects_budget(aws, scoped, monkeypatch):  # LEAD-1
+    _rb(monkeypatch, True)
+    _several_act_volumes(aws)
+    clock = [1000.0]
+    monkeypatch.setattr(scanner, "_clock", lambda: clock[0])
+    calls: list[str] = []
+
+    def throttled(**kwargs):
+        calls.append(kwargs["LookupAttributes"][0]["AttributeValue"])
+        clock[0] += scoped.scan_budget_seconds  # each lookup burns the whole budget
+        raise ClientError({"Error": {"Code": "ThrottlingException", "Message": "x"}}, "LookupEvents")
+
+    monkeypatch.setattr(aws.cloudtrail, "lookup_events", throttled)
+    report = scanner.scan(aws, scoped)
+    assert len(calls) == 1
+    notes = [f["evidence"]["owner"]["note"] for f in report["findings"] if f["evidence"]["owner"]]
+    assert any("time budget" in n for n in notes)
+
+
+def test_recycle_rules_costs_one_call_when_rbin_fails(aws, monkeypatch):  # LEAD-1
+    calls = []
+
+    def broken(**kwargs):
+        calls.append(kwargs)
+        raise ClientError({"Error": {"Code": "InternalFailure", "Message": "x"}}, "ListRules")
+
+    monkeypatch.setattr(aws.rbin, "list_rules", broken)
+    assert scanner.recycle_rules(aws) == [] and len(calls) == 1

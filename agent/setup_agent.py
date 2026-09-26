@@ -45,12 +45,14 @@ GATED_TOOLS: list[str] = [
     "delete_snapshot_permanently",
     "stop_instances",
     "release_address",
+    "quarantine_addresses",
     "restore_volume",
     "restore_snapshot",
     "start_instances",
+    "cancel_address_quarantine",
 ]
 
-# The only tools the unattended reporter can even see.
+# Read-only tools. watchdog_verify never changes AWS (it only records a sign-off in the ledger).
 READ_TOOLS: list[str] = [
     "warden_status",
     "scan_for_waste",
@@ -58,6 +60,22 @@ READ_TOOLS: list[str] = [
     "list_receipts",
     "get_receipt",
     "list_warden_backups",
+    "watchdog_verify",
+    "rollback_window",
+    "resource_history",
+]
+
+# The only tools the unattended reporter can even see. No watchdog_verify: the reporter never acts,
+# so it has no reason to mint sign-offs.
+REPORTER_TOOLS: list[str] = [
+    "warden_status",
+    "scan_for_waste",
+    "get_plan",
+    "list_receipts",
+    "get_receipt",
+    "list_warden_backups",
+    "rollback_window",
+    "resource_history",
 ]
 
 REPORTER_INSTRUCTIONS = """\
@@ -72,8 +90,10 @@ itself (`from mcp_client import call_tool`, then `scan = await call_tool("warden
 and prints the plan_id, one line per finding, every leak with its fix, the number of findings per \
 verdict, reversible vs irreversible proposed actions, estimated monthly savings (list-price \
 estimates), and the number of leaks. Report its output.
-3. Produce a short report: a findings table (resource, type, verdict, proposed action, \
-est. $/month, main reason), every `keep` with its reason, and every leak with its fix.
+3. Produce a short report: the decision list by tier (Safe & reversible / Needs your review / \
+Protected), a findings table (resource, type, tier, proposed action, est. $/month, `why`), every \
+`keep` with its reason, and every leak with its fix. Call `rollback_window` and list what can still \
+be undone, with its countdown.
 4. End with: "To act on this, open the `warden` agent and approve changes there." Include \
 the plan_id and say that it expires, so a fresh scan will be needed.
 
@@ -96,7 +116,8 @@ def build_mcp_server_manifest(url: str) -> dict[str, Any]:
         "name": SERVER_NAME,
         "description": (
             "Warden: approval-gated, reversible AWS cost cleanup (EBS volumes, snapshots, "
-            "idle EC2, Elastic IPs) with plan locks, safety re-checks, receipts and undo."
+            "idle EC2, Elastic IPs) with plan locks, an independent watchdog sign-off, a hash-chained "
+            "ledger, receipts, undo and a rollback countdown."
         ),
         "url": url,
     }
@@ -133,7 +154,7 @@ def build_reporter_manifest(model: str, instructions: str = REPORTER_INSTRUCTION
         "model": {"name": model, "params": {"temperature": 0.1}},
         "instructions": instructions,
         # Belt and braces: nothing mutating is enabled, and anything destructive would still pause.
-        "mcp_servers": [_mcp_entry(READ_TOOLS, ["@destructive"])],
+        "mcp_servers": [_mcp_entry(REPORTER_TOOLS, ["@destructive"])],
         "config": {
             "sandbox": {"enabled": True, "file_downloads": True},
             "generative_ui": {"enabled": True},

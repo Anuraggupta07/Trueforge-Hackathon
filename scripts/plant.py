@@ -188,6 +188,10 @@ class Planter:
         self.ec2.terminate_instances(InstanceIds=[iid])
         self._wait("instance_terminated", InstanceIds=[iid])
         orphan = self._find_volume(LEAK_VOLUME)
+        if orphan is None and self.settings.mock:
+            # moto ignores the template's block devices; create the volume AWS would have left behind.
+            orphan = self._create_volume(LEAK_VOLUME, 200, "gp3", app="reports-worker")
+            self._log(item, "mock", "moto skips launch-template disks; created the orphan it would leave")
         detail = orphan["VolumeId"] if orphan else "NOT FOUND (check the template's DeleteOnTermination)"
         self._log(item, "created", f"terminated {iid}; orphaned /dev/sdf volume: {detail}")
 
@@ -223,7 +227,8 @@ class Planter:
         item = "5 idle server"
         found = self._find_instance(IDLE_SERVER)
         if found:
-            self._log(item, "skip", f"{IDLE_SERVER} already exists ({found['InstanceId']})")
+            iid = found["InstanceId"]
+            self._log(item, "skip", f"{IDLE_SERVER} already exists ({iid})")
         else:
             run = self.ec2.run_instances(
                 ImageId=self.ami, InstanceType=INSTANCE_TYPE, MinCount=1, MaxCount=1,
@@ -233,6 +238,11 @@ class Planter:
             iid = run["Instances"][0]["InstanceId"]
             self._wait("instance_running", InstanceIds=[iid])
             self._log(item, "created", f"{IDLE_SERVER} {iid} t3.micro running (stuck fake download inside)")
+        if self.settings.mock:
+            from warden.mock import seed_idle_metrics
+
+            points = seed_idle_metrics(self.clients.cloudwatch, iid)
+            self._log(item, "mock", f"seeded {points} synthetic idle CloudWatch datapoints for {iid}")
         self._cost(IDLE_SERVER, pricing.instance_monthly_usd("t3.micro", self.settings.region), True)
 
     def ami_chain(self) -> None:
@@ -258,6 +268,8 @@ class Planter:
             )["ImageId"]
             self.ec2.create_tags(Resources=[ami_id], Tags=demo_tags(GOLDEN_AMI))
             self._log(item, "created", f"{GOLDEN_AMI} {ami_id} from {sid}")
+        if self.settings.mock:
+            self._mock_adopt_ami_snapshot(item, ami_id, sid)
         lt = self._find_template(WEB_LT)
         if lt:
             self._log(item, "skip", f"{WEB_LT} already exists ({lt['LaunchTemplateId']})")
@@ -270,6 +282,18 @@ class Planter:
             self._log(item, "created", f"{WEB_LT} {lt['LaunchTemplateId']} -> {ami_id}")
         self._ensure_tagged(lt["LaunchTemplateId"])
         self._cost(GOLDEN_SNAPSHOT, pricing.snapshot_monthly_usd(8, self.settings.region), False)
+
+    def _mock_adopt_ami_snapshot(self, item: str, ami_id: str, sid: str) -> None:
+        """moto's register_image ignores the given snapshot and invents its own; name that one the golden
+        snapshot (so the AMI chain is real in moto) and drop the unused helper snapshot."""
+        image = self.ec2.describe_images(ImageIds=[ami_id])["Images"][0]
+        real = next((m["Ebs"]["SnapshotId"] for m in image.get("BlockDeviceMappings") or []
+                     if (m.get("Ebs") or {}).get("SnapshotId")), None)
+        if not real or real == sid:
+            return
+        self.ec2.create_tags(Resources=[real], Tags=demo_tags(GOLDEN_SNAPSHOT))
+        self.ec2.delete_snapshot(SnapshotId=sid)
+        self._log(item, "mock", f"moto backed the AMI with {real}; it is now {GOLDEN_SNAPSHOT}")
 
     def injection_volume(self) -> None:
         item = "9 prompt-injection volume"
@@ -312,6 +336,9 @@ class Planter:
         self.ami, source = resolve_al2023_ami(self.clients)
         if not self.ami:
             raise SystemExit("Could not resolve the Amazon Linux 2023 AMI - run scripts/preflight.py")
+        if self.settings.mock:
+            self.out(f"MOCK MODE: planting into the local moto server at {self.settings.mock_endpoint} "
+                     "(no real AWS, nothing is billed)")
         self.out(f"Planting Warden demo in {self.settings.region} / {self.az} "
                  f"(subnet {self.subnet['SubnetId']}, AMI {self.ami} via {source})")
         steps: list[tuple[str, Callable[[], None]]] = [
@@ -342,6 +369,10 @@ class Planter:
         self.out(f"Estimated monthly waste Warden should clean up: ${cleanable:,.2f}/month "
                  f"({pricing.PRICING_NOTE}; snapshot figures are upper bounds)")
         self.out(f"All planted demo resources (incl. ones Warden must keep): ${total:,.2f}/month")
+        if self.settings.mock:
+            self.out("Mock mode: you can scan right away (idle history is synthetic, CloudTrail is empty).")
+            self.out("Clean up afterwards with: uv run python scripts/reset.py --yes (or restart the moto server)")
+            return cleanable
         self.out("Reminder: plant at least ~25 minutes before the demo scan. Warden ignores the idle server's "
                  "first 10 minutes (boot activity) and then needs CloudWatch data (5-minute periods, a few "
                  "minutes' delay); scanned earlier, it shows as 'review'. CloudTrail events can take up to "

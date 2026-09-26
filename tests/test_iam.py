@@ -27,7 +27,7 @@ def _allows(action: str) -> list[dict]:
 
 def _ec2_calls() -> set[str]:
     ops: set[str] = set()
-    for name in ("actions.py", "scanner.py", "server.py"):
+    for name in ("actions.py", "scanner.py", "server.py", "watchdog.py"):
         src = (ROOT / "src" / "warden" / name).read_text(encoding="utf-8")
         ops |= {m for m in re.findall(r"\bec2\.([a-z_]+)\b", src) if m not in NOT_API}
     return ops
@@ -42,6 +42,39 @@ def test_every_ec2_call_is_allowed():  # S2 / F6 / RA-6
     assert "delete_tags" in calls and "create_snapshot" in calls
     missing = sorted(_iam_name(op) for op in calls if not _allows(_iam_name(op)))
     assert missing == []
+
+
+SERVICE_PREFIX = {"route53": "route53", "r53": "route53", "elbv2": "elasticloadbalancing"}
+
+
+def _other_calls() -> set[str]:
+    """Route 53 / ELBv2 operations, called directly (client.op) or through _paginate(client, "op")."""
+    ops: set[str] = set()
+    for name in ("actions.py", "scanner.py", "server.py", "watchdog.py"):
+        src = (ROOT / "src" / "warden" / name).read_text(encoding="utf-8")
+        for client, op in re.findall(r"\b(route53|r53|elbv2)(?:\.|,\s*\")([a-z_]+)", src):
+            if op not in NOT_API:
+                ops.add(SERVICE_PREFIX[client] + ":" + "".join(p.capitalize() for p in op.split("_")))
+    return ops
+
+
+def test_every_route53_and_elbv2_call_is_allowed():  # v1.1 DNS / load balancer checks
+    calls = _other_calls()
+    assert calls == {
+        "route53:ListHostedZones", "route53:ListResourceRecordSets",
+        "elasticloadbalancing:DescribeTargetGroups", "elasticloadbalancing:DescribeTargetHealth",
+    }
+    assert [c for c in calls if not _allows(c)] == []
+
+
+def test_elastic_ip_tags_are_warden_keys_only():  # v1.1 EIP quarantine
+    eip = "arn:aws:ec2:*:*:elastic-ip/*"
+    for action in ("ec2:CreateTags", "ec2:DeleteTags"):
+        stmts = [s for s in _allows(action) if eip in (s["Resource"] if isinstance(s["Resource"], list) else [s["Resource"]])]
+        assert stmts, action
+        for s in stmts:
+            assert s["Condition"]["ForAllValues:StringLike"]["aws:TagKeys"] == ["warden:*"]
+            assert s["Condition"]["Null"]["aws:TagKeys"] == "false"
 
 
 def test_delete_tags_only_for_warden_keys():  # S2

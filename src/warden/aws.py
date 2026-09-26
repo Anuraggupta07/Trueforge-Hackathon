@@ -13,6 +13,9 @@ from botocore.exceptions import ClientError, WaiterError
 from .config import Settings
 
 _BOTO_CONFIG = Config(retries={"mode": "adaptive", "max_attempts": 8})
+# Optional evidence APIs (CloudTrail, Recycle Bin, Route 53, ELBv2) fail fast: a slow or broken optional
+# API must not push a tool call past the MCP request timeout (TrueForge aborts after 240 s).
+_EVIDENCE_CONFIG = Config(retries={"mode": "standard", "total_max_attempts": 2}, connect_timeout=3, read_timeout=8)
 
 
 class AwsClients:
@@ -20,11 +23,27 @@ class AwsClients:
 
     def __init__(self, settings: Settings, session: boto3.Session | None = None) -> None:
         self.settings = settings
+        if session is None and settings.mock:
+            # Dummy credentials: in mock mode real keys are never loaded, let alone sent anywhere.
+            from .mock import MOCK_CREDENTIALS
+
+            session = boto3.Session(region_name=settings.region, **MOCK_CREDENTIALS)
         self.session = session or boto3.Session(region_name=settings.region)
         self._account_id: str | None = None
 
-    def _client(self, service: str) -> Any:
-        return self.session.client(service, region_name=self.settings.region, config=_BOTO_CONFIG)
+    def client(self, service: str, config: Config | None = None) -> Any:
+        """A new client for any service (real AWS, or the moto endpoint plus mock shims in mock mode)."""
+        config = config or _BOTO_CONFIG
+        if not self.settings.mock:
+            return self.session.client(service, region_name=self.settings.region, config=config)
+        from .mock import install_hooks
+
+        client = self.session.client(service, region_name=self.settings.region, config=config,
+                                     endpoint_url=self.settings.mock_endpoint)
+        return install_hooks(service, client, self.settings)
+
+    def _client(self, service: str, config: Config | None = None) -> Any:
+        return self.client(service, config)
 
     @cached_property
     def ec2(self) -> Any:
@@ -36,11 +55,19 @@ class AwsClients:
 
     @cached_property
     def cloudtrail(self) -> Any:
-        return self._client("cloudtrail")
+        return self._client("cloudtrail", _EVIDENCE_CONFIG)
 
     @cached_property
     def rbin(self) -> Any:
-        return self._client("rbin")
+        return self._client("rbin", _EVIDENCE_CONFIG)
+
+    @cached_property
+    def route53(self) -> Any:
+        return self._client("route53", _EVIDENCE_CONFIG)
+
+    @cached_property
+    def elbv2(self) -> Any:
+        return self._client("elbv2", _EVIDENCE_CONFIG)
 
     @cached_property
     def sts(self) -> Any:

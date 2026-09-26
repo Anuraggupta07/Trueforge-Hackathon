@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import dataclasses
+import importlib
 import json
+import sys
 import time
+import types
 
 import pytest
 from botocore.exceptions import WaiterError
@@ -14,6 +17,9 @@ from warden import plan as plan_mod
 from warden.config import (
     TAG_BACKUP_OF,
     TAG_EXPIRES_AT,
+    TAG_PLAN_ID,
+    TAG_QUARANTINED_AT,
+    TAG_QUARANTINED_UNTIL,
     TAG_RECYCLE,
     TAG_RESTORE_AZ,
     TAG_RESTORED_FROM,
@@ -23,6 +29,40 @@ from warden.policy import tags_to_dict
 
 AZ = "us-east-1b"
 AMI = "ami-12c6146b"
+SIG = "wd-test-ok.sig"
+QUARANTINE_OVER = {TAG_QUARANTINED_AT: "1999-12-25T00:00:00Z", TAG_QUARANTINED_UNTIL: "2000-01-01T00:00:00Z"}
+QUARANTINE_ACTIVE = {TAG_QUARANTINED_UNTIL: "2999-01-01T00:00:00Z"}
+
+
+# ---------------------------------------------------------------- watchdog stub
+
+
+def install_watchdog_stub(monkeypatch, verdict=None) -> list[tuple]:
+    """Replace warden.watchdog.check_signoff (the real module may not exist yet) so these tests only
+    exercise the executor. Accepts SIG unless verdict says otherwise; returns the recorded calls."""
+    try:
+        module = importlib.import_module("warden.watchdog")
+    except Exception:  # noqa: BLE001 - module missing or mid-edit
+        module = types.ModuleType("warden.watchdog")
+        monkeypatch.setitem(sys.modules, "warden.watchdog", module)
+        import warden
+
+        monkeypatch.setattr(warden, "watchdog", module, raising=False)
+    calls: list[tuple] = []
+
+    def check_signoff(settings, token, plan_id, action, resource_ids, now=None):
+        calls.append((token, plan_id, action, list(resource_ids)))
+        if verdict is not None:
+            return verdict
+        return (True, "", {}) if token == SIG else (False, "HMAC mismatch", {})
+
+    monkeypatch.setattr(module, "check_signoff", check_signoff, raising=False)
+    return calls
+
+
+@pytest.fixture(autouse=True)
+def watchdog_calls(monkeypatch):
+    return install_watchdog_stub(monkeypatch)
 
 
 # ---------------------------------------------------------------- helpers
@@ -57,6 +97,18 @@ def make_instance(aws, tags: dict[str, str] | None = None) -> dict:
 def make_address(aws, tags: dict[str, str] | None = None) -> dict:
     alloc = aws.ec2.allocate_address(Domain="vpc", TagSpecifications=_tagspec("elastic-ip", tags or {}))
     return aws.ec2.describe_addresses(AllocationIds=[alloc["AllocationId"]])["Addresses"][0]
+
+
+def make_quarantined_address(aws, settings) -> dict:
+    """An Elastic IP whose Warden quarantine (tags + receipt) ended in the past."""
+    addr = make_address(aws, QUARANTINE_OVER)
+    audit.save_receipt(settings, {
+        "receipt_id": audit.new_id("rcpt"), "action": "quarantine_address", "plan_id": "plan-x",
+        "finished_at": QUARANTINE_OVER[TAG_QUARANTINED_AT],
+        "results": [{"resource_id": addr["AllocationId"], "status": "done",
+                     "quarantined_at": QUARANTINE_OVER[TAG_QUARANTINED_AT]}],
+    })
+    return addr
 
 
 WARDEN_RULE = {
@@ -128,7 +180,7 @@ def test_quarantine_happy_path_backup_then_delete(aws, settings):
     vid = vol["VolumeId"]
     pid = make_plan(aws, settings, [("volume", "quarantine_volume", vol)])
 
-    receipt = actions.quarantine_volumes(aws, settings, pid, [vid])
+    receipt = actions.quarantine_volumes(aws, settings, pid, [vid], signoff=SIG)
 
     assert statuses(receipt) == ["done"], receipt
     res = receipt["results"][0]
@@ -153,7 +205,7 @@ def test_quarantine_happy_path_backup_then_delete(aws, settings):
 def test_receipt_persisted_and_audit_written(aws, settings):
     vol = make_volume(aws)
     pid = make_plan(aws, settings, [("volume", "quarantine_volume", vol)])
-    receipt = actions.quarantine_volumes(aws, settings, pid, [vol["VolumeId"]])
+    receipt = actions.quarantine_volumes(aws, settings, pid, [vol["VolumeId"]], signoff=SIG)
 
     assert audit.load_receipt(settings, receipt["receipt_id"]) == receipt
     assert audit.list_receipts(settings)[0]["receipt_id"] == receipt["receipt_id"]
@@ -172,7 +224,7 @@ def test_backup_not_completed_keeps_volume(aws, settings, monkeypatch):
             raise WaiterError(name="SnapshotCompleted", reason="Max attempts exceeded", last_response={})
 
     monkeypatch.setattr(aws.ec2, "get_waiter", lambda name: SlowWaiter())
-    receipt = actions.quarantine_volumes(aws, settings, pid, [vid])
+    receipt = actions.quarantine_volumes(aws, settings, pid, [vid], signoff=SIG)
 
     res = receipt["results"][0]
     assert res["status"] == "skipped"
@@ -188,7 +240,7 @@ def test_volume_reattached_after_plan_is_skipped(aws, settings):
     inst = make_instance(aws)
     aws.ec2.attach_volume(VolumeId=vid, InstanceId=inst["InstanceId"], Device="/dev/sdf")
 
-    receipt = actions.quarantine_volumes(aws, settings, pid, [vid])
+    receipt = actions.quarantine_volumes(aws, settings, pid, [vid], signoff=SIG)
 
     assert statuses(receipt) == ["skipped"]
     assert "changed since approval" in receipt["results"][0]["detail"]
@@ -203,7 +255,7 @@ def test_retagged_production_after_plan_is_skipped(aws, settings):
     pid = make_plan(aws, settings, [("volume", "quarantine_volume", vol)])
     aws.ec2.create_tags(Resources=[vid], Tags=[{"Key": "Env", "Value": "Production"}])
 
-    receipt = actions.quarantine_volumes(aws, settings, pid, [vid])
+    receipt = actions.quarantine_volumes(aws, settings, pid, [vid], signoff=SIG)
 
     res = receipt["results"][0]
     assert res["status"] == "skipped"
@@ -217,7 +269,7 @@ def test_innocent_tag_change_is_fingerprint_drift(aws, settings):
     pid = make_plan(aws, settings, [("volume", "quarantine_volume", vol)])
     aws.ec2.create_tags(Resources=[vid], Tags=[{"Key": "owner", "Value": "alice"}])
 
-    receipt = actions.quarantine_volumes(aws, settings, pid, [vid])
+    receipt = actions.quarantine_volumes(aws, settings, pid, [vid], signoff=SIG)
     assert statuses(receipt) == ["skipped"]
     assert "changed since approval" in receipt["results"][0]["detail"]
 
@@ -227,7 +279,7 @@ def test_volume_gone_is_skipped(aws, settings):
     pid = make_plan(aws, settings, [("volume", "quarantine_volume", vol)])
     aws.ec2.delete_volume(VolumeId=vol["VolumeId"])
 
-    receipt = actions.quarantine_volumes(aws, settings, pid, [vol["VolumeId"]])
+    receipt = actions.quarantine_volumes(aws, settings, pid, [vol["VolumeId"]], signoff=SIG)
     assert receipt["results"][0]["detail"] == "no longer exists"
 
 
@@ -238,7 +290,7 @@ def test_scope_tag_removed_after_plan_is_skipped(aws, settings):
     pid = make_plan(aws, scoped, [("volume", "quarantine_volume", vol)])
     aws.ec2.delete_tags(Resources=[vid], Tags=[{"Key": "warden:demo"}])
 
-    receipt = actions.quarantine_volumes(aws, scoped, pid, [vid])
+    receipt = actions.quarantine_volumes(aws, scoped, pid, [vid], signoff=SIG)
     assert statuses(receipt) == ["skipped"]
     assert "no longer in scope" in receipt["results"][0]["detail"]
 
@@ -251,7 +303,7 @@ def test_freeze_refuses_everything(aws, settings):
     vol = make_volume(aws)
     pid = make_plan(aws, frozen, [("volume", "quarantine_volume", vol)])
 
-    receipt = actions.quarantine_volumes(aws, frozen, pid, [vol["VolumeId"]])
+    receipt = actions.quarantine_volumes(aws, frozen, pid, [vol["VolumeId"]], signoff=SIG)
 
     assert receipt["freeze"] is True
     assert statuses(receipt) == ["skipped"]
@@ -268,7 +320,7 @@ def test_freeze_blocks_undo_tools_too(aws, settings):
 
 def test_wrong_plan_id(aws, settings):
     vol = make_volume(aws)
-    receipt = actions.quarantine_volumes(aws, settings, "plan-does-not-exist", [vol["VolumeId"]])
+    receipt = actions.quarantine_volumes(aws, settings, "plan-does-not-exist", [vol["VolumeId"]], signoff=SIG)
     assert statuses(receipt) == ["skipped"]
     assert "not found" in receipt["results"][0]["detail"]
 
@@ -277,7 +329,7 @@ def test_id_not_in_plan_rejected(aws, settings):
     planned, other = make_volume(aws), make_volume(aws)
     pid = make_plan(aws, settings, [("volume", "quarantine_volume", planned)])
 
-    receipt = actions.quarantine_volumes(aws, settings, pid, [other["VolumeId"]])
+    receipt = actions.quarantine_volumes(aws, settings, pid, [other["VolumeId"]], signoff=SIG)
     assert statuses(receipt) == ["skipped"]
     assert "not in plan" in receipt["results"][0]["detail"]
     assert aws.ec2.describe_volumes(VolumeIds=[other["VolumeId"]])["Volumes"]
@@ -286,14 +338,14 @@ def test_id_not_in_plan_rejected(aws, settings):
 def test_keep_verdict_rejected(aws, settings):
     vol = make_volume(aws)
     pid = make_plan(aws, settings, [("volume", "quarantine_volume", vol)], verdict="keep")
-    receipt = actions.quarantine_volumes(aws, settings, pid, [vol["VolumeId"]])
+    receipt = actions.quarantine_volumes(aws, settings, pid, [vol["VolumeId"]], signoff=SIG)
     assert "not 'act'" in receipt["results"][0]["detail"]
 
 
 def test_expired_plan(aws, settings):
     vol = make_volume(aws)
     pid = make_plan(aws, settings, [("volume", "quarantine_volume", vol)], now=time.time() - 2 * 3600)
-    receipt = actions.quarantine_volumes(aws, settings, pid, [vol["VolumeId"]])
+    receipt = actions.quarantine_volumes(aws, settings, pid, [vol["VolumeId"]], signoff=SIG)
     assert statuses(receipt) == ["skipped"]
     assert "expired" in receipt["results"][0]["detail"]
 
@@ -301,7 +353,7 @@ def test_expired_plan(aws, settings):
 def test_batch_over_cap(aws, settings):
     vols = [make_volume(aws) for _ in range(settings.max_batch + 1)]
     pid = make_plan(aws, settings, [("volume", "quarantine_volume", v) for v in vols])
-    receipt = actions.quarantine_volumes(aws, settings, pid, [v["VolumeId"] for v in vols])
+    receipt = actions.quarantine_volumes(aws, settings, pid, [v["VolumeId"] for v in vols], signoff=SIG)
     assert statuses(receipt) == ["skipped"] * len(vols)
     assert "exceeds the limit" in receipt["results"][0]["detail"]
     assert len(aws.ec2.describe_volumes()["Volumes"]) == len(vols)
@@ -311,7 +363,7 @@ def test_batch_over_cap(aws, settings):
 def test_empty_and_wildcard_rejected(aws, settings, ids):
     vol = make_volume(aws)
     pid = make_plan(aws, settings, [("volume", "quarantine_volume", vol)])
-    receipt = actions.quarantine_volumes(aws, settings, pid, ids)
+    receipt = actions.quarantine_volumes(aws, settings, pid, ids, signoff=SIG)
     assert receipt["counts"]["done"] == 0
     assert set(statuses(receipt)) == {"skipped"}
 
@@ -321,7 +373,7 @@ def test_irreversible_with_two_ids_rejected(aws, settings):
     pid = make_plan(aws, settings, [("address", "release_address", a), ("address", "release_address", b)])
     ids = [a["AllocationId"], b["AllocationId"]]
     # Bypass the single-id signature to prove the gate itself enforces it.
-    receipt = actions._run_gated(aws, settings, "release_address", pid, ids, actions._release_one)
+    receipt = actions._run_gated(aws, settings, "release_address", pid, ids, actions._release_one, signoff=SIG)
     assert statuses(receipt) == ["skipped", "skipped"]
     assert "exactly one id" in receipt["results"][0]["detail"]
     assert len(aws.ec2.describe_addresses()["Addresses"]) == 2
@@ -330,7 +382,7 @@ def test_irreversible_with_two_ids_rejected(aws, settings):
 def test_wrong_action_for_plan_item(aws, settings):
     snap = make_snapshot(aws)
     pid = make_plan(aws, settings, [("snapshot", "recycle_snapshot", snap)])
-    receipt = actions.delete_snapshot_permanently(aws, settings, pid, snap["SnapshotId"])
+    receipt = actions.delete_snapshot_permanently(aws, settings, pid, snap["SnapshotId"], signoff=SIG)
     assert statuses(receipt) == ["skipped"]
     assert "not 'delete_snapshot'" in receipt["results"][0]["detail"]
 
@@ -350,7 +402,7 @@ def test_recycle_snapshot_happy_path(aws, settings, recycle_bin, monkeypatch):
 
     monkeypatch.setattr(aws.ec2, "create_tags", spy)
     pid = make_plan(aws, settings, [("snapshot", "recycle_snapshot", snap)])
-    receipt = actions.recycle_snapshots(aws, settings, pid, [sid])
+    receipt = actions.recycle_snapshots(aws, settings, pid, [sid], signoff=SIG)
 
     assert statuses(receipt) == ["done"], receipt
     assert "verified" in receipt["results"][0]["detail"]
@@ -363,7 +415,7 @@ def test_recycle_refused_without_recycle_bin_rule(aws, settings, monkeypatch):
     snap = make_snapshot(aws)
     monkeypatch.setattr(actions, "_recycle_rules", lambda clients: [])
     pid = make_plan(aws, settings, [("snapshot", "recycle_snapshot", snap)])
-    receipt = actions.recycle_snapshots(aws, settings, pid, [snap["SnapshotId"]])
+    receipt = actions.recycle_snapshots(aws, settings, pid, [snap["SnapshotId"]], signoff=SIG)
     assert statuses(receipt) == ["skipped"]
     assert "Recycle Bin rule missing" in receipt["results"][0]["detail"]
     assert aws.ec2.describe_snapshots(SnapshotIds=[snap["SnapshotId"]])["Snapshots"]
@@ -373,7 +425,7 @@ def test_recycle_verification_unavailable_degrades(aws, settings, monkeypatch):
     snap = make_snapshot(aws)
     monkeypatch.setattr(actions, "_recycle_rules", lambda clients: [WARDEN_RULE])
     pid = make_plan(aws, settings, [("snapshot", "recycle_snapshot", snap)])
-    receipt = actions.recycle_snapshots(aws, settings, pid, [snap["SnapshotId"]])
+    receipt = actions.recycle_snapshots(aws, settings, pid, [snap["SnapshotId"]], signoff=SIG)
     assert statuses(receipt) == ["done"]
     assert "verification unavailable" in receipt["results"][0]["detail"]
 
@@ -384,7 +436,7 @@ def test_restore_snapshot_only_if_warden_recycled(aws, settings, recycle_bin):
     assert "not recycled by Warden" in actions.restore_snapshot(aws, settings, sid)["results"][0]["detail"]
 
     pid = make_plan(aws, settings, [("snapshot", "recycle_snapshot", snap)])
-    assert statuses(actions.recycle_snapshots(aws, settings, pid, [sid])) == ["done"]
+    assert statuses(actions.recycle_snapshots(aws, settings, pid, [sid], signoff=SIG)) == ["done"]
     receipt = actions.restore_snapshot(aws, settings, sid)
     assert statuses(receipt) == ["done"], receipt
     assert sid not in recycle_bin
@@ -394,7 +446,7 @@ def test_delete_snapshot_permanently(aws, settings):
     snap = make_snapshot(aws)
     sid = snap["SnapshotId"]
     pid = make_plan(aws, settings, [("snapshot", "delete_snapshot", snap)])
-    receipt = actions.delete_snapshot_permanently(aws, settings, pid, sid)
+    receipt = actions.delete_snapshot_permanently(aws, settings, pid, sid, signoff=SIG)
     assert statuses(receipt) == ["done"]
     assert receipt["results"][0]["undo"] is None
     assert "IRREVERSIBLE" in receipt["results"][0]["detail"]
@@ -409,7 +461,7 @@ def test_stop_then_start_instance(aws, settings):
     iid = inst["InstanceId"]
     pid = make_plan(aws, settings, [("instance", "stop_instance", inst)])
 
-    receipt = actions.stop_instances(aws, settings, pid, [iid])
+    receipt = actions.stop_instances(aws, settings, pid, [iid], signoff=SIG)
     assert statuses(receipt) == ["done"], receipt
     assert receipt["results"][0]["undo"] == {"tool": "start_instances", "args": {"instance_ids": [iid]}}
     assert receipt["est_monthly_savings_usd"] == pytest.approx(round(0.0104 * 730, 2))
@@ -443,11 +495,11 @@ def test_start_instances_batch_cap_and_wildcard(aws, settings):
 
 
 def test_release_address_records_ip(aws, settings):
-    addr = make_address(aws)
+    addr = make_quarantined_address(aws, settings)
     aid, ip = addr["AllocationId"], addr["PublicIp"]
     pid = make_plan(aws, settings, [("address", "release_address", addr)])
 
-    receipt = actions.release_address(aws, settings, pid, aid)
+    receipt = actions.release_address(aws, settings, pid, aid, signoff=SIG)
 
     res = receipt["results"][0]
     assert res["status"] == "done", receipt
@@ -458,12 +510,12 @@ def test_release_address_records_ip(aws, settings):
 
 
 def test_release_address_associated_after_plan_skipped(aws, settings):
-    addr = make_address(aws)
+    addr = make_quarantined_address(aws, settings)
     pid = make_plan(aws, settings, [("address", "release_address", addr)])
     inst = make_instance(aws)
     aws.ec2.associate_address(AllocationId=addr["AllocationId"], InstanceId=inst["InstanceId"])
 
-    receipt = actions.release_address(aws, settings, pid, addr["AllocationId"])
+    receipt = actions.release_address(aws, settings, pid, addr["AllocationId"], signoff=SIG)
     assert statuses(receipt) == ["skipped"]
     assert len(aws.ec2.describe_addresses()["Addresses"]) == 1
 
@@ -475,7 +527,7 @@ def test_restore_volume_recreates_with_original_tags_in_az(aws, settings):
     vol = make_volume(aws, {"Name": "db-scratch", "team": "data", "warden:demo": "true"}, vtype="gp3", size=12)
     vid = vol["VolumeId"]
     pid = make_plan(aws, settings, [("volume", "quarantine_volume", vol)])
-    snap_id = actions.quarantine_volumes(aws, settings, pid, [vid])["results"][0]["backup_snapshot_id"]
+    snap_id = actions.quarantine_volumes(aws, settings, pid, [vid], signoff=SIG)["results"][0]["backup_snapshot_id"]
 
     receipt = actions.restore_volume(aws, settings, snap_id)
 
@@ -509,7 +561,7 @@ def test_per_item_aws_error_becomes_failed(aws, settings, monkeypatch):
         raise ClientError({"Error": {"Code": "UnauthorizedOperation", "Message": "no"}}, "StopInstances")
 
     monkeypatch.setattr(aws.ec2, "stop_instances", boom)
-    receipt = actions.stop_instances(aws, settings, pid, [inst["InstanceId"]])
+    receipt = actions.stop_instances(aws, settings, pid, [inst["InstanceId"]], signoff=SIG)
     assert statuses(receipt) == ["failed"]
     assert "UnauthorizedOperation" in receipt["results"][0]["detail"]
 
@@ -542,7 +594,7 @@ def test_quarantine_total_wait_fits_mcp_timeout(aws, settings, monkeypatch):  # 
             clock["t"] += actions.CALL_BUDGET_SECONDS - 5  # the first snapshot eats the budget
 
     monkeypatch.setattr(aws.ec2, "get_waiter", lambda name: SlowButDone())
-    receipt = actions.quarantine_volumes(aws, settings, pid, [v["VolumeId"] for v in vols])
+    receipt = actions.quarantine_volumes(aws, settings, pid, [v["VolumeId"] for v in vols], signoff=SIG)
 
     assert statuses(receipt) == ["done", "skipped"], receipt
     assert sum(configured) <= actions.CALL_BUDGET_SECONDS < 240
@@ -562,11 +614,12 @@ def test_quarantine_rerun_reuses_pending_backup(aws, settings, monkeypatch):  # 
             raise WaiterError(name="SnapshotCompleted", reason="Max attempts exceeded", last_response={})
 
     monkeypatch.setattr(aws.ec2, "get_waiter", lambda name: Pending())
-    first = actions.quarantine_volumes(aws, settings, pid, [vid])
+    first = actions.quarantine_volumes(aws, settings, pid, [vid], signoff=SIG)
     assert statuses(first) == ["skipped"]
     monkeypatch.undo()
     monkeypatch.setattr(actions, "_sleep", lambda seconds: None)
-    second = actions.quarantine_volumes(aws, settings, pid, [vid])
+    install_watchdog_stub(monkeypatch)
+    second = actions.quarantine_volumes(aws, settings, pid, [vid], signoff=SIG)
     assert statuses(second) == ["done"], second
     assert second["results"][0]["backup_snapshot_id"] == first["results"][0]["backup_snapshot_id"]
 
@@ -632,7 +685,7 @@ def test_recycle_waits_for_tag_before_deleting(aws, settings, recycle_bin, monke
 
     monkeypatch.setattr(aws.ec2, "describe_snapshots", lagging_describe)
     monkeypatch.setattr(aws.ec2, "delete_snapshot", delete)
-    receipt = actions.recycle_snapshots(aws, settings, pid, [sid])
+    receipt = actions.recycle_snapshots(aws, settings, pid, [sid], signoff=SIG)
     assert statuses(receipt) == ["done"], receipt
     assert seen["tag_visible_before_delete"]
 
@@ -653,7 +706,7 @@ def test_recycle_keeps_snapshot_when_tag_never_visible(aws, settings, recycle_bi
         return out
 
     monkeypatch.setattr(aws.ec2, "describe_snapshots", never_tagged)
-    receipt = actions.recycle_snapshots(aws, settings, pid, [sid])
+    receipt = actions.recycle_snapshots(aws, settings, pid, [sid], signoff=SIG)
     assert statuses(receipt) == ["failed"]
     assert "not deleted" in receipt["results"][0]["detail"]
     assert sid not in recycle_bin
@@ -672,7 +725,7 @@ def test_recycle_bin_listing_lag_is_retried(aws, settings, recycle_bin, monkeypa
         return {"Snapshots": []} if polls["n"] < 3 else real_list(**kw)
 
     monkeypatch.setattr(aws.ec2, "list_snapshots_in_recycle_bin", lagging)
-    receipt = actions.recycle_snapshots(aws, settings, pid, [sid])
+    receipt = actions.recycle_snapshots(aws, settings, pid, [sid], signoff=SIG)
     assert statuses(receipt) == ["done"], receipt
     assert "verified" in receipt["results"][0]["detail"]
 
@@ -686,7 +739,7 @@ def test_recycle_verification_error_never_claims_recycle_bin(aws, settings, recy
         raise _client_error("InvalidSnapshot.NotFound", "ListSnapshotsInRecycleBin")
 
     monkeypatch.setattr(aws.ec2, "list_snapshots_in_recycle_bin", boom)
-    receipt = actions.recycle_snapshots(aws, settings, pid, [sid])
+    receipt = actions.recycle_snapshots(aws, settings, pid, [sid], signoff=SIG)
     detail = receipt["results"][0]["detail"]
     assert "moved to Recycle Bin" not in detail
     assert "NOT guaranteed" in detail
@@ -698,7 +751,7 @@ def test_restore_allowed_after_unverified_recycle(aws, settings, recycle_bin, mo
     pid = make_plan(aws, settings, [("snapshot", "recycle_snapshot", snap)])
     real_list = aws.ec2.list_snapshots_in_recycle_bin
     monkeypatch.setattr(aws.ec2, "list_snapshots_in_recycle_bin", lambda **kw: {"Snapshots": []})
-    receipt = actions.recycle_snapshots(aws, settings, pid, [sid])
+    receipt = actions.recycle_snapshots(aws, settings, pid, [sid], signoff=SIG)
     assert statuses(receipt) == ["failed"]  # not seen in the bin (yet)
     monkeypatch.setattr(aws.ec2, "list_snapshots_in_recycle_bin", real_list)  # the bin catches up
     restored = actions.restore_snapshot(aws, settings, sid)
@@ -711,7 +764,7 @@ def test_recycle_skips_snapshot_excluded_by_region_rule(aws, settings, recycle_b
             "ExcludeResourceTags": [{"ResourceTagKey": "env", "ResourceTagValue": "dev"}]}
     monkeypatch.setattr(actions, "_recycle_rules", lambda clients: [rule])
     pid = make_plan(aws, settings, [("snapshot", "recycle_snapshot", snap)])
-    receipt = actions.recycle_snapshots(aws, settings, pid, [snap["SnapshotId"]])
+    receipt = actions.recycle_snapshots(aws, settings, pid, [snap["SnapshotId"]], signoff=SIG)
     assert statuses(receipt) == ["skipped"]
     assert snap["SnapshotId"] not in recycle_bin
     assert aws.ec2.describe_snapshots(SnapshotIds=[snap["SnapshotId"]])["Snapshots"]
@@ -730,7 +783,7 @@ def test_start_refuses_out_of_scope_instance(aws, settings):  # S7
     inst = make_instance(aws, {"Name": "x"})
     iid = inst["InstanceId"]
     pid = make_plan(aws, settings, [("instance", "stop_instance", inst)])
-    assert statuses(actions.stop_instances(aws, settings, pid, [iid])) == ["done"]
+    assert statuses(actions.stop_instances(aws, settings, pid, [iid], signoff=SIG)) == ["done"]
     scoped = dataclasses.replace(settings, scope_tag_key="warden:demo", scope_tag_value="true")
     receipt = actions.start_instances(aws, scoped, [iid])
     assert statuses(receipt) == ["skipped"]
@@ -740,7 +793,8 @@ def test_start_refuses_out_of_scope_instance(aws, settings):  # S7
 def test_restore_volume_refuses_out_of_scope_backup(aws, settings):  # S7
     vol = make_volume(aws, {"Name": "x"})
     pid = make_plan(aws, settings, [("volume", "quarantine_volume", vol)])
-    snap_id = actions.quarantine_volumes(aws, settings, pid, [vol["VolumeId"]])["results"][0]["backup_snapshot_id"]
+    receipt = actions.quarantine_volumes(aws, settings, pid, [vol["VolumeId"]], signoff=SIG)
+    snap_id = receipt["results"][0]["backup_snapshot_id"]
     scoped = dataclasses.replace(settings, scope_tag_key="warden:demo", scope_tag_value="true")
     receipt = actions.restore_volume(aws, scoped, snap_id)
     assert statuses(receipt) == ["skipped"]
@@ -760,7 +814,7 @@ def test_stop_rechecks_activity_before_stopping(aws, settings, monkeypatch):  # 
         return {"Datapoints": [{stat: 90.0 if kw["MetricName"] == "CPUUtilization" else 10.0}]}
 
     monkeypatch.setattr(aws.cloudwatch, "get_metric_statistics", busy)
-    receipt = actions.stop_instances(aws, settings, pid, [iid])
+    receipt = actions.stop_instances(aws, settings, pid, [iid], signoff=SIG)
     assert statuses(receipt) == ["skipped"]
     assert "active" in receipt["results"][0]["detail"]
     desc = aws.ec2.describe_instances(InstanceIds=[iid])["Reservations"][0]["Instances"][0]
@@ -772,14 +826,14 @@ def test_freeze_file_blocks_without_restart(aws, settings):  # S14
     pid = make_plan(aws, settings, [("volume", "quarantine_volume", vol)])
     settings.state_dir.mkdir(parents=True, exist_ok=True)
     (settings.state_dir / "FREEZE").write_text("", encoding="utf-8")
-    receipt = actions.quarantine_volumes(aws, settings, pid, [vol["VolumeId"]])
+    receipt = actions.quarantine_volumes(aws, settings, pid, [vol["VolumeId"]], signoff=SIG)
     assert statuses(receipt) == ["skipped"] and receipt["freeze"] is True
     assert statuses(actions.start_instances(aws, settings, ["i-12345678"])) == ["skipped"]
     assert aws.ec2.describe_volumes(VolumeIds=[vol["VolumeId"]])["Volumes"]
 
 
 def test_release_is_done_even_if_describe_lags(aws, settings, monkeypatch):  # RA-3 (a)
-    addr = make_address(aws)
+    addr = make_quarantined_address(aws, settings)
     aid = addr["AllocationId"]
     pid = make_plan(aws, settings, [("address", "release_address", addr)])
     real_describe = aws.ec2.describe_addresses
@@ -794,7 +848,7 @@ def test_release_is_done_even_if_describe_lags(aws, settings, monkeypatch):  # R
     monkeypatch.setattr(aws.ec2, "release_address", release)
     monkeypatch.setattr(aws.ec2, "describe_addresses",
                         lambda **kw: {"Addresses": [addr]} if stale["on"] else real_describe(**kw))
-    receipt = actions.release_address(aws, settings, pid, aid)
+    receipt = actions.release_address(aws, settings, pid, aid, signoff=SIG)
     assert statuses(receipt) == ["done"], receipt
     assert "IRREVERSIBLE" in receipt["results"][0]["detail"]
 
@@ -815,7 +869,7 @@ def test_delete_snapshot_is_done_even_if_describe_lags(aws, settings, monkeypatc
     monkeypatch.setattr(aws.ec2, "delete_snapshot", delete)
     monkeypatch.setattr(aws.ec2, "describe_snapshots",
                         lambda **kw: {"Snapshots": [snap]} if stale["on"] else real_describe(**kw))
-    receipt = actions.delete_snapshot_permanently(aws, settings, pid, sid)
+    receipt = actions.delete_snapshot_permanently(aws, settings, pid, sid, signoff=SIG)
     assert statuses(receipt) == ["done"], receipt
 
 
@@ -843,7 +897,7 @@ def test_stop_and_start_trust_the_api_response(aws, settings, monkeypatch):  # R
 
     monkeypatch.setattr(aws.ec2, "describe_instances", stale_describe)
     monkeypatch.setattr(aws.ec2, "stop_instances", stop)
-    assert statuses(actions.stop_instances(aws, settings, pid, [iid])) == ["done"]
+    assert statuses(actions.stop_instances(aws, settings, pid, [iid], signoff=SIG)) == ["done"]
 
     stale_view["state"] = None
     real_start = aws.ec2.start_instances
@@ -861,7 +915,8 @@ def test_stop_and_start_trust_the_api_response(aws, settings, monkeypatch):  # R
 def test_restore_volume_done_even_if_new_volume_not_yet_describable(aws, settings, monkeypatch):  # RA-3 (e)
     vol = make_volume(aws)
     pid = make_plan(aws, settings, [("volume", "quarantine_volume", vol)])
-    snap_id = actions.quarantine_volumes(aws, settings, pid, [vol["VolumeId"]])["results"][0]["backup_snapshot_id"]
+    receipt = actions.quarantine_volumes(aws, settings, pid, [vol["VolumeId"]], signoff=SIG)
+    snap_id = receipt["results"][0]["backup_snapshot_id"]
 
     def not_yet(**_):
         raise _client_error("InvalidVolume.NotFound", "DescribeVolumes")
@@ -869,3 +924,290 @@ def test_restore_volume_done_even_if_new_volume_not_yet_describable(aws, setting
     monkeypatch.setattr(aws.ec2, "describe_volumes", not_yet)
     receipt = actions.restore_volume(aws, settings, snap_id)
     assert statuses(receipt) == ["done"], receipt
+
+
+# ---------------------------------------------------------------- watchdog sign-off gate (v1.1)
+
+
+@pytest.mark.parametrize("token", [None, "", "   "])
+def test_missing_signoff_skips_everything(aws, settings, watchdog_calls, token):
+    vol = make_volume(aws)
+    pid = make_plan(aws, settings, [("volume", "quarantine_volume", vol)])
+    receipt = actions.quarantine_volumes(aws, settings, pid, [vol["VolumeId"]], signoff=token)
+    assert statuses(receipt) == ["skipped"]
+    detail = receipt["results"][0]["detail"]
+    assert detail.startswith("Watchdog sign-off rejected: missing sign-off token")
+    assert "call watchdog_verify first" in detail
+    assert watchdog_calls == []
+    assert aws.ec2.describe_volumes(VolumeIds=[vol["VolumeId"]])["Volumes"][0]["State"] == "available"
+    backups = aws.ec2.describe_snapshots(Filters=[{"Name": f"tag:{TAG_BACKUP_OF}", "Values": [vol["VolumeId"]]}])
+    assert backups["Snapshots"] == []
+
+
+def test_signoff_is_required_keyword(aws, settings):
+    with pytest.raises(TypeError):
+        actions.stop_instances(aws, settings, "plan-x", ["i-12345678"])  # type: ignore[call-arg]
+
+
+def test_rejected_signoff_skips_everything_and_mutates_nothing(aws, settings, watchdog_calls):
+    insts = [make_instance(aws), make_instance(aws)]
+    ids = [i["InstanceId"] for i in insts]
+    pid = make_plan(aws, settings, [("instance", "stop_instance", i) for i in insts])
+
+    receipt = actions.stop_instances(aws, settings, pid, ids, signoff="wd-forged.deadbeef")
+
+    assert statuses(receipt) == ["skipped", "skipped"]
+    for r in receipt["results"]:
+        assert r["detail"] == "Watchdog sign-off rejected: HMAC mismatch - call watchdog_verify first"
+    assert watchdog_calls == [("wd-forged.deadbeef", pid, "stop_instance", ids)]
+    for iid in ids:
+        desc = aws.ec2.describe_instances(InstanceIds=[iid])["Reservations"][0]["Instances"][0]
+        assert desc["State"]["Name"] == "running"
+        assert TAG_STOPPED_AT not in tags_to_dict(desc.get("Tags"))
+
+
+@pytest.mark.parametrize("reason", ["expired", "already consumed", "plan/action mismatch"])
+def test_every_rejection_reason_is_reported(aws, settings, monkeypatch, reason):
+    install_watchdog_stub(monkeypatch, verdict=(False, reason, {}))
+    snap = make_snapshot(aws)
+    pid = make_plan(aws, settings, [("snapshot", "delete_snapshot", snap)])
+    receipt = actions.delete_snapshot_permanently(aws, settings, pid, snap["SnapshotId"], signoff=SIG)
+    assert statuses(receipt) == ["skipped"]
+    assert reason in receipt["results"][0]["detail"]
+    assert aws.ec2.describe_snapshots(SnapshotIds=[snap["SnapshotId"]])["Snapshots"]
+
+
+def test_watchdog_error_is_a_rejection(aws, settings, monkeypatch):
+    install_watchdog_stub(monkeypatch)
+    wd = sys.modules["warden.watchdog"]
+
+    def boom(*a, **k):
+        raise RuntimeError("key file unreadable")
+
+    monkeypatch.setattr(wd, "check_signoff", boom)
+    vol = make_volume(aws)
+    pid = make_plan(aws, settings, [("volume", "quarantine_volume", vol)])
+    receipt = actions.quarantine_volumes(aws, settings, pid, [vol["VolumeId"]], signoff=SIG)
+    assert statuses(receipt) == ["skipped"]
+    assert "could not be checked" in receipt["results"][0]["detail"]
+    assert aws.ec2.describe_volumes(VolumeIds=[vol["VolumeId"]])["Volumes"]
+
+
+def test_freeze_wins_before_signoff(aws, settings, watchdog_calls):
+    frozen = dataclasses.replace(settings, freeze=True)
+    receipt = actions.stop_instances(aws, frozen, "plan-x", ["i-12345678"], signoff="bogus")
+    assert receipt["results"][0]["detail"] == actions.FROZEN_DETAIL
+    assert watchdog_calls == []
+
+
+def test_signed_fingerprint_must_match_plan(aws, settings, monkeypatch):
+    inst = make_instance(aws)
+    iid = inst["InstanceId"]
+    pid = make_plan(aws, settings, [("instance", "stop_instance", inst)])
+    install_watchdog_stub(monkeypatch, verdict=(True, "", {iid: "some-other-fingerprint"}))
+    receipt = actions.stop_instances(aws, settings, pid, [iid], signoff=SIG)
+    assert statuses(receipt) == ["skipped"]
+    assert "different state" in receipt["results"][0]["detail"]
+
+
+def test_executor_keeps_its_own_recheck_after_signoff(aws, settings):  # defence in depth
+    vol = make_volume(aws)
+    vid = vol["VolumeId"]
+    pid = make_plan(aws, settings, [("volume", "quarantine_volume", vol)])
+    aws.ec2.create_tags(Resources=[vid], Tags=[{"Key": "Env", "Value": "Production"}])
+    receipt = actions.quarantine_volumes(aws, settings, pid, [vid], signoff=SIG)
+    assert statuses(receipt) == ["skipped"]
+    assert "production" in receipt["results"][0]["detail"]
+
+
+# ---------------------------------------------------------------- EIP quarantine-before-release
+
+
+def _addr_tags(aws, aid: str) -> dict[str, str]:
+    return tags_to_dict(aws.ec2.describe_addresses(AllocationIds=[aid])["Addresses"][0].get("Tags"))
+
+
+def test_quarantine_addresses_tags_and_receipt(aws, settings, watchdog_calls):
+    addr = make_address(aws, {"Name": "old-ip"})
+    aid, ip = addr["AllocationId"], addr["PublicIp"]
+    pid = make_plan(aws, settings, [("address", "quarantine_address", addr)])
+
+    before = time.time()
+    receipt = actions.quarantine_addresses(aws, settings, pid, [aid], signoff=SIG)
+
+    assert statuses(receipt) == ["done"], receipt
+    res = receipt["results"][0]
+    assert res["undo"] == {"tool": "cancel_address_quarantine", "args": {"allocation_id": aid}}
+    assert res["public_ip"] == ip and "quarantined" in res["detail"]
+    assert receipt["action"] == "quarantine_address" and receipt["est_monthly_savings_usd"] == 0.0
+    assert watchdog_calls == [(SIG, pid, "quarantine_address", [aid])]
+    tags = _addr_tags(aws, aid)
+    assert tags[TAG_PLAN_ID] == pid and TAG_QUARANTINED_AT in tags
+    until = actions._parse_utc(tags[TAG_QUARANTINED_UNTIL]).timestamp()
+    expected = before + settings.quarantine_minutes * 60
+    assert expected - 5 <= until <= expected + 65
+    assert len(aws.ec2.describe_addresses()["Addresses"]) == 1  # nothing released
+
+
+def test_quarantine_addresses_skips_associated(aws, settings):
+    addr = make_address(aws)
+    aid = addr["AllocationId"]
+    pid = make_plan(aws, settings, [("address", "quarantine_address", addr)])
+    inst = make_instance(aws)
+    aws.ec2.associate_address(AllocationId=aid, InstanceId=inst["InstanceId"])
+    receipt = actions.quarantine_addresses(aws, settings, pid, [aid], signoff=SIG)
+    assert statuses(receipt) == ["skipped"]
+    assert TAG_QUARANTINED_UNTIL not in _addr_tags(aws, aid)
+
+
+def test_quarantine_addresses_requires_signoff(aws, settings):
+    addr = make_address(aws)
+    aid = addr["AllocationId"]
+    pid = make_plan(aws, settings, [("address", "quarantine_address", addr)])
+    receipt = actions.quarantine_addresses(aws, settings, pid, [aid], signoff="nope")
+    assert statuses(receipt) == ["skipped"]
+    assert TAG_QUARANTINED_UNTIL not in _addr_tags(aws, aid)
+
+
+def test_cancel_address_quarantine_removes_tags(aws, settings):
+    addr = make_address(aws, {"Name": "keep-me"})
+    aid = addr["AllocationId"]
+    pid = make_plan(aws, settings, [("address", "quarantine_address", addr)])
+    assert statuses(actions.quarantine_addresses(aws, settings, pid, [aid], signoff=SIG)) == ["done"]
+
+    receipt = actions.cancel_address_quarantine(aws, settings, aid)
+
+    assert statuses(receipt) == ["done"], receipt
+    assert receipt["plan_id"] is None and receipt["action"] == "cancel_address_quarantine"
+    assert _addr_tags(aws, aid) == {"Name": "keep-me"}
+
+
+def test_cancel_address_quarantine_refuses_untagged(aws, settings):
+    addr = make_address(aws, {"Name": "never-quarantined"})
+    receipt = actions.cancel_address_quarantine(aws, settings, addr["AllocationId"])
+    assert statuses(receipt) == ["skipped"]
+    assert "not quarantined by Warden" in receipt["results"][0]["detail"]
+    assert _addr_tags(aws, addr["AllocationId"]) == {"Name": "never-quarantined"}
+
+
+def test_cancel_address_quarantine_frozen(aws, settings):
+    frozen = dataclasses.replace(settings, freeze=True)
+    addr = make_address(aws, QUARANTINE_ACTIVE)
+    receipt = actions.cancel_address_quarantine(aws, frozen, addr["AllocationId"])
+    assert receipt["results"][0]["detail"] == actions.FROZEN_DETAIL
+    assert TAG_QUARANTINED_UNTIL in _addr_tags(aws, addr["AllocationId"])
+
+
+def test_release_refused_when_never_quarantined(aws, settings):
+    addr = make_address(aws)
+    pid = make_plan(aws, settings, [("address", "release_address", addr)])
+    receipt = actions.release_address(aws, settings, pid, addr["AllocationId"], signoff=SIG)
+    assert statuses(receipt) == ["skipped"]
+    assert "must be quarantined first" in receipt["results"][0]["detail"]
+    assert len(aws.ec2.describe_addresses()["Addresses"]) == 1
+
+
+def test_release_refused_inside_quarantine_window(aws, settings):
+    addr = make_address(aws, QUARANTINE_ACTIVE)
+    pid = make_plan(aws, settings, [("address", "release_address", addr)])
+    receipt = actions.release_address(aws, settings, pid, addr["AllocationId"], signoff=SIG)
+    assert statuses(receipt) == ["skipped"]
+    assert "still in quarantine until 2999-01-01T00:00:00Z" in receipt["results"][0]["detail"]
+    assert len(aws.ec2.describe_addresses()["Addresses"]) == 1
+
+
+def test_quarantine_then_release_after_window(aws, settings):
+    fast = dataclasses.replace(settings, quarantine_minutes=1)
+    addr = make_address(aws)
+    aid = addr["AllocationId"]
+    pid = make_plan(aws, fast, [("address", "quarantine_address", addr)])
+    assert statuses(actions.quarantine_addresses(aws, fast, pid, [aid], signoff=SIG)) == ["done"]
+
+    quarantined = aws.ec2.describe_addresses(AllocationIds=[aid])["Addresses"][0]
+    pid2 = make_plan(aws, fast, [("address", "release_address", quarantined)])
+    early = actions.release_address(aws, fast, pid2, aid, signoff=SIG)
+    assert statuses(early) == ["skipped"] and "still in quarantine" in early["results"][0]["detail"]
+
+    # The window passes (simulated by back-dating the tag, then re-scanning into a fresh plan).
+    aws.ec2.create_tags(Resources=[aid], Tags=[{"Key": TAG_QUARANTINED_UNTIL, "Value": "2000-01-01T00:00:00Z"}])
+    expired = aws.ec2.describe_addresses(AllocationIds=[aid])["Addresses"][0]
+    pid3 = make_plan(aws, fast, [("address", "release_address", expired)])
+    receipt = actions.release_address(aws, fast, pid3, aid, signoff=SIG)
+    assert statuses(receipt) == ["done"], receipt
+    assert "IRREVERSIBLE" in receipt["results"][0]["detail"]
+    assert aws.ec2.describe_addresses()["Addresses"] == []
+
+
+# ---------------------------------------------------------------- review fixes
+
+
+def test_release_refused_without_warden_quarantine_receipt(aws, settings):  # bypass F1
+    addr = make_address(aws, QUARANTINE_OVER)  # tags look right, but Warden never quarantined it
+    pid = make_plan(aws, settings, [("address", "release_address", addr)])
+    receipt = actions.release_address(aws, settings, pid, addr["AllocationId"], signoff=SIG)
+    assert statuses(receipt) == ["skipped"] and "not set by Warden" in receipt["results"][0]["detail"]
+    assert len(aws.ec2.describe_addresses()["Addresses"]) == 1
+
+
+def test_release_refused_when_quarantine_was_voided(aws, settings):  # bypass F1 / demo F2
+    addr = make_quarantined_address(aws, settings)
+    aid = addr["AllocationId"]
+    audit.record_quarantine_void(settings, aid, tags_to_dict(addr["Tags"]), "seen associated")
+    pid = make_plan(aws, settings, [("address", "release_address", addr)])
+    receipt = actions.release_address(aws, settings, pid, aid, signoff=SIG)
+    assert statuses(receipt) == ["skipped"] and "void" in receipt["results"][0]["detail"]
+    assert len(aws.ec2.describe_addresses()["Addresses"]) == 1
+
+
+def test_quarantine_receipt_records_the_window(aws, settings):  # bypass F1: release binds to this record
+    addr = make_address(aws)
+    aid = addr["AllocationId"]
+    pid = make_plan(aws, settings, [("address", "quarantine_address", addr)])
+    res = actions.quarantine_addresses(aws, settings, pid, [aid], signoff=SIG)["results"][0]
+    tags = _addr_tags(aws, aid)
+    assert res["quarantined_at"] == tags[TAG_QUARANTINED_AT]
+    assert res["quarantined_until"] == tags[TAG_QUARANTINED_UNTIL]
+
+
+def test_release_rechecks_dns_right_before_releasing(aws, settings, monkeypatch):  # bypass F4
+    from warden import scanner
+
+    addr = make_quarantined_address(aws, settings)
+    ip = addr["PublicIp"]
+    pid = make_plan(aws, settings, [("address", "release_address", addr)])
+    monkeypatch.setattr(scanner, "dns_references",
+                        lambda clients, public_ip, **kw: ["shop.example.com (A) in zone example.com"])
+    receipt = actions.release_address(aws, settings, pid, addr["AllocationId"], signoff=SIG)
+    assert statuses(receipt) == ["skipped"] and "shop.example.com" in receipt["results"][0]["detail"]
+
+    def down(clients, public_ip, **kw):
+        assert kw.get("strict") is True
+        raise RuntimeError("route53 down")
+
+    monkeypatch.setattr(scanner, "dns_references", down)
+    receipt = actions.release_address(aws, settings, pid, addr["AllocationId"], signoff=SIG)
+    assert statuses(receipt) == ["skipped"] and "could not check DNS" in receipt["results"][0]["detail"]
+    assert aws.ec2.describe_addresses(AllocationIds=[addr["AllocationId"]])["Addresses"][0]["PublicIp"] == ip
+
+
+def test_delete_snapshot_rechecks_ami_use_right_before_deleting(aws, settings, monkeypatch):  # bypass F4
+    snap = make_snapshot(aws)
+    sid = snap["SnapshotId"]
+    pid = make_plan(aws, settings, [("snapshot", "delete_snapshot", snap)])
+    image = {"ImageId": "ami-new", "BlockDeviceMappings": [{"Ebs": {"SnapshotId": sid}}]}
+    monkeypatch.setattr(aws.ec2, "describe_images", lambda **kw: {"Images": [image]})
+    receipt = actions.delete_snapshot_permanently(aws, settings, pid, sid, signoff=SIG)
+    assert statuses(receipt) == ["skipped"] and "ami-new" in receipt["results"][0]["detail"]
+    assert aws.ec2.describe_snapshots(SnapshotIds=[sid])["Snapshots"]
+
+
+def test_restore_volume_is_in_the_source_volume_history(aws, settings):  # demo F3
+    vol = make_volume(aws, {"Name": "db-scratch"})
+    vid = vol["VolumeId"]
+    pid = make_plan(aws, settings, [("volume", "quarantine_volume", vol)])
+    snap_id = actions.quarantine_volumes(aws, settings, pid, [vid], signoff=SIG)["results"][0]["backup_snapshot_id"]
+    res = actions.restore_volume(aws, settings, snap_id)["results"][0]
+    assert res["status"] == "done" and res["restored_volume_id"].startswith("vol-")
+    latest = audit.history(settings, vid)[0]
+    assert latest["event"] == "action_item" and latest["action"] == "restore_volume"
+    assert res["restored_volume_id"] in latest["resource_ids"]

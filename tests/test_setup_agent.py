@@ -27,9 +27,11 @@ MUTATING = {
     "delete_snapshot_permanently",
     "stop_instances",
     "release_address",
+    "quarantine_addresses",
     "restore_volume",
     "restore_snapshot",
     "start_instances",
+    "cancel_address_quarantine",
 }
 
 
@@ -67,11 +69,35 @@ def test_reporter_has_only_read_tools():
         "list_receipts",
         "get_receipt",
         "list_warden_backups",
+        "rollback_window",
+        "resource_history",
     }
+    assert "watchdog_verify" not in server["enable_tools"]
     assert not (set(server["enable_tools"]) & MUTATING)
     assert "@all" not in server["enable_tools"]
     assert m["config"]["ask_user_questions"]["enabled"] is False
     assert "report" in m["instructions"].lower()
+
+
+def test_tool_lists_match_the_server_registry():
+    import asyncio
+
+    from mcp import Client
+
+    from warden import server
+
+    async def go() -> dict:
+        async with Client(server.server) as client:
+            return {t.name: t for t in (await client.list_tools()).tools}
+
+    tools = asyncio.run(go())
+    assert set(sa.GATED_TOOLS) | set(sa.READ_TOOLS) == set(tools)
+    assert not set(sa.GATED_TOOLS) & set(sa.READ_TOOLS)
+    for name in sa.READ_TOOLS:
+        assert tools[name].annotations.read_only_hint is True, name
+    for name in sa.GATED_TOOLS:
+        assert tools[name].annotations.read_only_hint is False, name
+    assert set(sa.REPORTER_TOOLS) <= set(sa.READ_TOOLS)
 
 
 def test_manifests_validate_against_sdk_models():
@@ -123,6 +149,10 @@ def test_instructions_file_is_reasonable():
     assert len(text.split()) <= 1000
     for word in ("warden_status", "scan_for_waste", "IRREVERSIBLE", "CHANGE-RECORD.md", "untrusted"):
         assert word in text
+    for word in ("watchdog_verify", "signoff", "rollback_window", "resource_history", "quarantine_addresses"):
+        assert word in text
+    for tier in ("Safe & reversible", "Needs your review", "Protected"):
+        assert tier in text
 
 
 def test_dry_run_prints_without_calling_server(monkeypatch, capsys):
@@ -248,3 +278,10 @@ def test_sandbox_fetches_tool_data_itself():  # F5
 def test_instructions_check_receipts_after_a_tool_timeout():  # F2
     text = sa.load_instructions()
     assert "list_receipts" in text and "time" in text
+
+
+def test_instructions_explain_review_verdicts_cannot_be_executed():  # demo F4
+    text = sa.load_instructions()
+    assert "verdict `review`" in text
+    assert "rescan" in text.lower() and "env" in text
+    assert "quarantine void" in text  # rollback flag wording matches watchdog.rollback_window

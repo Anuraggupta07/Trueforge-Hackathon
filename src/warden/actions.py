@@ -1,7 +1,7 @@
 """Mutating actions. Every public function returns a receipt; per-item failures never raise.
 
-Plan-gated flow: freeze check -> plan.validate_request -> for each approved id:
-re-describe -> scope + policy recheck -> fingerprint compare -> act -> verify -> result.
+Plan-gated flow: freeze check -> Watchdog sign-off (independent, single use) -> plan.validate_request ->
+for each approved id: re-describe -> scope + policy recheck -> fingerprint compare -> act -> verify -> result.
 """
 
 from __future__ import annotations
@@ -20,6 +20,8 @@ from .config import (
     TAG_BACKUP_OF,
     TAG_EXPIRES_AT,
     TAG_PLAN_ID,
+    TAG_QUARANTINED_AT,
+    TAG_QUARANTINED_UNTIL,
     TAG_RECYCLE,
     TAG_RECYCLE_VALUE,
     TAG_RECYCLED_AT,
@@ -56,7 +58,7 @@ BOOKKEEPING_TAGS = frozenset(
     {
         TAG_BACKUP_OF, TAG_EXPIRES_AT, TAG_PLAN_ID, TAG_RECYCLE, TAG_RECYCLED_AT, TAG_STOPPED_AT,
         TAG_RESTORE_AZ, TAG_RESTORE_TYPE, TAG_RESTORE_SIZE, TAG_RESTORE_IOPS, TAG_RESTORE_THROUGHPUT,
-        TAG_RESTORED_FROM,
+        TAG_RESTORED_FROM, TAG_QUARANTINED_AT, TAG_QUARANTINED_UNTIL,
     }
 )
 
@@ -96,6 +98,17 @@ def _skipped(resource_id: str, detail: str, **kw: Any) -> Outcome:
 
 def _failed(resource_id: str, detail: str, **kw: Any) -> Outcome:
     return _result(resource_id, "failed", detail, **kw), 0.0
+
+
+def _parse_utc(text: str | None) -> datetime | None:
+    """Parse a Warden ISO timestamp ('...Z'); None when missing or malformed."""
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(text).strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 def _requested(ids: Any) -> list[str]:
@@ -181,6 +194,8 @@ def _finish(settings: Settings, receipt: dict, outcomes: list[Outcome]) -> dict:
             resource_id=r["resource_id"],
             status=r["status"],
             detail=r["detail"],
+            # Other ids this result is about (e.g. restore_volume: source and new volume), for resource_history.
+            **({"resource_ids": r["related_ids"]} if r.get("related_ids") else {}),
         )
     try:
         audit_mod.save_receipt(settings, receipt)
@@ -287,6 +302,21 @@ def _recheck(
     return resource, None
 
 
+def _check_signoff(
+    settings: Settings, signoff: Any, plan_id: Any, action: str, ids: list[str]
+) -> tuple[bool, str, dict]:
+    """Ask the independent Watchdog whether this exact call was signed off. Never raises."""
+    if not isinstance(signoff, str) or not signoff.strip():
+        return False, "missing sign-off token", {}
+    try:
+        from . import watchdog
+
+        ok, reason, fps = watchdog.check_signoff(settings, signoff.strip(), str(plan_id), action, list(ids))
+    except Exception as err:  # noqa: BLE001 - no verifiable sign-off means no action
+        return False, f"sign-off could not be checked ({type(err).__name__}: {err})", {}
+    return bool(ok), str(reason or ""), dict(fps or {})
+
+
 def _run_gated(
     clients: AwsClients,
     settings: Settings,
@@ -295,12 +325,19 @@ def _run_gated(
     resource_ids: Any,
     actor: Actor,
     preflight: Callable[[], str | None] | None = None,
+    *,
+    signoff: str,
 ) -> dict:
-    """Shared freeze -> validate -> recheck -> act loop for plan-gated actions."""
+    """Shared freeze -> sign-off -> validate -> recheck -> act loop for plan-gated actions."""
     receipt = _new_receipt(clients, settings, action, plan_id if isinstance(plan_id, str) else None)
     requested = _requested(resource_ids)
     if is_frozen(settings):
         return _finish(settings, receipt, [_skipped(rid, FROZEN_DETAIL) for rid in requested])
+
+    ok, why, signed_fps = _check_signoff(settings, signoff, plan_id, action, requested)
+    if not ok:
+        detail = f"Watchdog sign-off rejected: {why} - call watchdog_verify first"
+        return _finish(settings, receipt, [_skipped(rid, detail) for rid in requested])
 
     ids = list(resource_ids) if isinstance(resource_ids, (list, tuple)) else resource_ids
     plan, approved, rejected = plan_mod.validate_request(
@@ -318,6 +355,9 @@ def _run_gated(
         item = plan.items[rid]
 
         def step(item: plan_mod.PlanItem = item) -> Outcome:
+            signed = signed_fps.get(item.resource_id)
+            if signed and signed != item.fingerprint:
+                return _skipped(item.resource_id, "Watchdog signed off a different state than the plan; re-verify")
             resource, skip = _recheck(clients, settings, item)
             if skip:
                 return skip
@@ -435,7 +475,9 @@ def _quarantine_one(
     return _result(vol_id, "done", detail, undo=undo, backup_snapshot_id=snap_id), _volume_cost(volume, settings)
 
 
-def quarantine_volumes(clients: AwsClients, settings: Settings, plan_id: str, volume_ids: list[str]) -> dict:
+def quarantine_volumes(
+    clients: AwsClients, settings: Settings, plan_id: str, volume_ids: list[str], *, signoff: str
+) -> dict:
     """Back up each approved unused volume to a completed snapshot, then delete it. Reversible.
 
     All snapshot waits in one call share CALL_BUDGET_SECONDS, so the call answers before the MCP client
@@ -446,7 +488,7 @@ def quarantine_volumes(clients: AwsClients, settings: Settings, plan_id: str, vo
     def actor(c: AwsClients, s: Settings, pid: str, vid: str, vol: dict) -> Outcome:
         return _quarantine_one(c, s, pid, vid, vol, deadline)
 
-    return _run_gated(clients, settings, "quarantine_volume", plan_id, volume_ids, actor)
+    return _run_gated(clients, settings, "quarantine_volume", plan_id, volume_ids, actor, signoff=signoff)
 
 
 # ---------------------------------------------------------------- snapshots
@@ -533,7 +575,9 @@ def _recycle_one(clients: AwsClients, settings: Settings, plan_id: str, snap_id:
     return _result(snap_id, "done", "moved to Recycle Bin (verified); restorable via restore_snapshot", undo=undo), saved
 
 
-def recycle_snapshots(clients: AwsClients, settings: Settings, plan_id: str, snapshot_ids: list[str]) -> dict:
+def recycle_snapshots(
+    clients: AwsClients, settings: Settings, plan_id: str, snapshot_ids: list[str], *, signoff: str
+) -> dict:
     """Tag and delete snapshots into the Recycle Bin (retention rule required). Reversible."""
     rules: list[dict] = []
 
@@ -551,10 +595,27 @@ def recycle_snapshots(clients: AwsClients, settings: Settings, plan_id: str, sna
             )
         return _recycle_one(c, s, pid, sid, snap)
 
-    return _run_gated(clients, settings, "recycle_snapshot", plan_id, snapshot_ids, actor, preflight)
+    return _run_gated(clients, settings, "recycle_snapshot", plan_id, snapshot_ids, actor, preflight, signoff=signoff)
+
+
+def _ami_users(clients: AwsClients, snapshot_id: str) -> list[str]:
+    """Self-owned AMIs whose block devices use this snapshot (raises if AMIs cannot be listed)."""
+    images = clients.ec2.describe_images(Owners=["self"]).get("Images") or []
+    return [
+        str(img.get("ImageId"))
+        for img in images
+        if any((b.get("Ebs") or {}).get("SnapshotId") == snapshot_id for b in img.get("BlockDeviceMappings") or [])
+    ]
 
 
 def _delete_snapshot_one(clients: AwsClients, settings: Settings, plan_id: str, snap_id: str, snap: dict) -> Outcome:
+    # Irreversible: re-check AMI use right before deleting (an AMI may have been registered since sign-off).
+    try:
+        amis = _ami_users(clients, snap_id)
+    except Exception as err:  # noqa: BLE001 - fail closed
+        return _skipped(snap_id, f"could not check which AMIs use it ({error_code(err)}); snapshot kept")
+    if amis:
+        return _skipped(snap_id, f"changed since approval: used by AMI {', '.join(amis)}; snapshot kept")
     try:
         clients.ec2.delete_snapshot(SnapshotId=snap_id)
     except ClientError as err:
@@ -566,9 +627,13 @@ def _delete_snapshot_one(clients: AwsClients, settings: Settings, plan_id: str, 
     return _result(snap_id, "done", detail), saved
 
 
-def delete_snapshot_permanently(clients: AwsClients, settings: Settings, plan_id: str, snapshot_id: str) -> dict:
+def delete_snapshot_permanently(
+    clients: AwsClients, settings: Settings, plan_id: str, snapshot_id: str, *, signoff: str
+) -> dict:
     """Permanently delete exactly one snapshot. IRREVERSIBLE."""
-    return _run_gated(clients, settings, "delete_snapshot", plan_id, [snapshot_id], _delete_snapshot_one)
+    return _run_gated(
+        clients, settings, "delete_snapshot", plan_id, [snapshot_id], _delete_snapshot_one, signoff=signoff
+    )
 
 
 # ---------------------------------------------------------------- instances
@@ -631,18 +696,91 @@ def _stop_one(clients: AwsClients, settings: Settings, plan_id: str, inst_id: st
     return _result(inst_id, "done", detail, undo=undo), saved
 
 
-def stop_instances(clients: AwsClients, settings: Settings, plan_id: str, instance_ids: list[str]) -> dict:
+def stop_instances(
+    clients: AwsClients, settings: Settings, plan_id: str, instance_ids: list[str], *, signoff: str
+) -> dict:
     """Stop idle instances (never terminate). Reversible via start_instances."""
-    return _run_gated(clients, settings, "stop_instance", plan_id, instance_ids, _stop_one)
+    return _run_gated(clients, settings, "stop_instance", plan_id, instance_ids, _stop_one, signoff=signoff)
 
 
 # ---------------------------------------------------------------- addresses
 
 
+def _associated(addr: dict) -> bool:
+    return bool(addr.get("AssociationId") or addr.get("InstanceId") or addr.get("NetworkInterfaceId"))
+
+
+def _quarantine_address_one(
+    clients: AwsClients, settings: Settings, plan_id: str, alloc_id: str, addr: dict
+) -> Outcome:
+    ip = addr.get("PublicIp")
+    if _associated(addr):
+        return _skipped(alloc_id, "address is now associated; not quarantined", public_ip=ip)
+    now = datetime.now(timezone.utc)
+    until = _utc_iso(now + timedelta(minutes=settings.quarantine_minutes))
+    clients.ec2.create_tags(
+        Resources=[alloc_id],
+        Tags=_to_aws_tags({TAG_QUARANTINED_AT: _utc_iso(now), TAG_QUARANTINED_UNTIL: until, TAG_PLAN_ID: plan_id}),
+    )
+
+    def tagged() -> bool:
+        current = _describe_address(clients, alloc_id)
+        return bool(current) and policy.tags_to_dict(current.get("Tags")).get(TAG_QUARANTINED_UNTIL) == until
+
+    undo = {"tool": "cancel_address_quarantine", "args": {"allocation_id": alloc_id}}
+    if not _settle(tagged):
+        return _failed(
+            alloc_id, f"{TAG_QUARANTINED_UNTIL} tag not visible after tagging; address kept, quarantine not "
+            "confirmed - try again", undo=undo, public_ip=ip,
+        )
+    detail = (
+        f"quarantined {ip} until {until} (still allocated, nothing released). release_address becomes possible "
+        "only after the window, with its own approval; undo via cancel_address_quarantine"
+    )
+    result = _result(alloc_id, "done", detail, undo=undo, public_ip=ip)
+    # release_address later requires a receipt that recorded exactly this quarantine.
+    result.update(quarantined_at=_utc_iso(now), quarantined_until=until)
+    return result, 0.0
+
+
+def quarantine_addresses(
+    clients: AwsClients, settings: Settings, plan_id: str, allocation_ids: list[str], *, signoff: str
+) -> dict:
+    """Mark unassociated Elastic IPs as quarantined for settings.quarantine_minutes. Reversible; releases nothing."""
+    return _run_gated(
+        clients, settings, "quarantine_address", plan_id, allocation_ids, _quarantine_address_one, signoff=signoff
+    )
+
+
 def _release_one(clients: AwsClients, settings: Settings, plan_id: str, alloc_id: str, addr: dict) -> Outcome:
     ip = addr.get("PublicIp")
-    if addr.get("AssociationId") or addr.get("InstanceId") or addr.get("NetworkInterfaceId"):
+    tags = policy.tags_to_dict(addr.get("Tags"))
+    if _associated(addr):
+        if TAG_QUARANTINED_UNTIL in tags:
+            audit_mod.record_quarantine_void(settings, alloc_id, tags, "seen associated by the executor")
         return _skipped(alloc_id, "address is now associated; not released", public_ip=ip)
+    raw_until = tags.get(TAG_QUARANTINED_UNTIL)
+    until = _parse_utc(raw_until)
+    if until is None:
+        return _skipped(
+            alloc_id, f"must be quarantined first (no valid {TAG_QUARANTINED_UNTIL} tag); not released", public_ip=ip
+        )
+    if until > datetime.now(timezone.utc):
+        return _skipped(alloc_id, f"still in quarantine until {raw_until}; not released", public_ip=ip)
+    problem = audit_mod.quarantine_problem(settings, alloc_id, tags)
+    if problem:
+        return _skipped(alloc_id, f"{problem}; quarantine it again first; not released", public_ip=ip)
+    # Irreversible: re-check DNS right before releasing (a record may have been created since sign-off).
+    from . import scanner
+
+    try:
+        refs = scanner.dns_references(clients, str(ip or ""), strict=True) if ip else []
+    except Exception as err:  # noqa: BLE001 - fail closed
+        return _skipped(alloc_id, f"could not check DNS records ({error_code(err)}); not released", public_ip=ip)
+    if refs:
+        return _skipped(
+            alloc_id, f"changed since approval: DNS record {'; '.join(refs)} points at {ip}; not released", public_ip=ip
+        )
     try:
         clients.ec2.release_address(AllocationId=alloc_id)
     except ClientError as err:
@@ -656,9 +794,11 @@ def _release_one(clients: AwsClients, settings: Settings, plan_id: str, alloc_id
     return _result(alloc_id, "done", detail, public_ip=ip), pricing.address_monthly_usd(settings.region)
 
 
-def release_address(clients: AwsClients, settings: Settings, plan_id: str, allocation_id: str) -> dict:
-    """Release exactly one unassociated Elastic IP. IRREVERSIBLE."""
-    return _run_gated(clients, settings, "release_address", plan_id, [allocation_id], _release_one)
+def release_address(
+    clients: AwsClients, settings: Settings, plan_id: str, allocation_id: str, *, signoff: str
+) -> dict:
+    """Release exactly one unassociated Elastic IP whose quarantine window has passed. IRREVERSIBLE."""
+    return _run_gated(clients, settings, "release_address", plan_id, [allocation_id], _release_one, signoff=signoff)
 
 
 # ---------------------------------------------------------------- undo tools (no plan)
@@ -726,7 +866,9 @@ def _restore_volume_one(clients: AwsClients, settings: Settings, snap_id: str) -
     created = clients.ec2.create_volume(**kwargs)  # its response is authoritative; describe may lag
     new_vol = created["VolumeId"]
     detail = f"restored {source} as {new_vol} in {az} ({vtype}, state {created.get('State')}); attach it where needed"
-    return _result(snap_id, "done", detail, backup_snapshot_id=snap_id), 0.0
+    result = _result(snap_id, "done", detail, backup_snapshot_id=snap_id)
+    result.update(restored_volume_id=new_vol, related_ids=[source, new_vol])
+    return result, 0.0
 
 
 def restore_volume(clients: AwsClients, settings: Settings, backup_snapshot_id: str) -> dict:
@@ -811,4 +953,30 @@ def start_instances(clients: AwsClients, settings: Settings, instance_ids: list[
     return _run_simple(
         clients, settings, "start_instances", instance_ids, settings.max_batch,
         lambda iid: _start_one(clients, settings, iid),
+    )
+
+
+def _cancel_quarantine_one(clients: AwsClients, settings: Settings, alloc_id: str) -> Outcome:
+    addr = _describe_address(clients, alloc_id)
+    if addr is None:
+        return _skipped(alloc_id, "no longer exists")
+    ip = addr.get("PublicIp")
+    tags = policy.tags_to_dict(addr.get("Tags"))
+    if TAG_QUARANTINED_UNTIL not in tags:
+        return _skipped(
+            alloc_id, f"not quarantined by Warden (no {TAG_QUARANTINED_UNTIL} tag); nothing to cancel", public_ip=ip
+        )
+    if not policy.in_scope(tags, settings):
+        return _skipped(alloc_id, f"not in scope ({settings.scope_label}); refusing to change it", public_ip=ip)
+    clients.ec2.delete_tags(
+        Resources=[alloc_id], Tags=[{"Key": TAG_QUARANTINED_AT}, {"Key": TAG_QUARANTINED_UNTIL}, {"Key": TAG_PLAN_ID}]
+    )
+    return _result(alloc_id, "done", f"quarantine cancelled; {ip} kept and will not be released", public_ip=ip), 0.0
+
+
+def cancel_address_quarantine(clients: AwsClients, settings: Settings, allocation_id: str) -> dict:
+    """Undo quarantine_addresses: remove Warden's quarantine tags from one Elastic IP."""
+    return _run_simple(
+        clients, settings, "cancel_address_quarantine", [allocation_id], 1,
+        lambda aid: _cancel_quarantine_one(clients, settings, aid),
     )

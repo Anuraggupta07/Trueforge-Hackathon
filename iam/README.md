@@ -2,11 +2,11 @@
 
 Warden has **two independent locks**. A change goes through only if both allow it.
 
-1. **Warden's code (first lock).** Before any change, the MCP server checks the plan lock (only ids from a fresh scan, with the action the scan proposed), batch limits (irreversible actions take exactly one id), the freeze switch, the scope tag, and protected, managed-by-code and suspicious tags. It then re-checks each resource just before acting. The LLM cannot change any of this; every check runs in Python.
+1. **Warden's code (first lock).** Before any change, the MCP server checks the plan lock (only ids from a fresh scan, with the action the scan proposed), batch limits (irreversible actions take exactly one id), the freeze switch, the scope tag, and protected, managed-by-code and suspicious tags. An independent Watchdog (`src/warden/watchdog.py`) re-describes every resource and issues a single-use, HMAC-signed sign-off, and the executor refuses to act without it. The executor then re-checks each resource just before acting. The LLM cannot change any of this; every check runs in Python.
 2. **AWS IAM (second lock).** `warden-policy.json` gives the Warden identity only the API calls Warden needs. It also has explicit **Deny** statements that AWS enforces even if Warden had a bug:
    - `ec2:TerminateInstances` is always denied.
    - `DeleteVolume`, `DeleteSnapshot`, `StopInstances` and `ReleaseAddress` are denied on resources whose `env`, `environment` or `stage` tag starts with `prod` or `prd` (lower, Title or UPPER case, so `production`, `Prod-EU` and `PRD` too; IAM is slightly stricter than the code here), on resources that carry a `legal-hold`, `legal_hold` or `legalhold` tag (any value), a `dr` tag (any value except `false`/`no`/`0`) or `role=dr`, and on resources tagged `warden:protect=true`.
-   - Tags can only be written two ways: any tags while a snapshot or volume is being **created** (Warden's backups and restores copy the original tags), or later only keys starting with `warden:`. `DeleteTags` is also limited to `warden:` keys. So Warden can never rewrite or remove a protection tag such as `env` or `legal-hold`.
+   - Tags can only be written two ways: any tags while a snapshot or volume is being **created** (Warden's backups and restores copy the original tags), or later only keys starting with `warden:` (on volumes, snapshots, instances and Elastic IPs; this is how an Elastic IP is quarantined). `DeleteTags` is also limited to `warden:` keys. So Warden can never rewrite or remove a protection tag such as `env` or `legal-hold`.
 
    In IAM an explicit Deny always beats an Allow, so these holds apply even if someone later attaches a broader policy to the same identity.
 
@@ -15,8 +15,9 @@ Warden has **two independent locks**. A change goes through only if both allow i
 | Purpose | Actions |
 | --- | --- |
 | Discovery (read-only) | `ec2:Describe*`, `ec2:ListSnapshotsInRecycleBin`, `cloudwatch:GetMetricStatistics`, `cloudwatch:GetMetricData`, `cloudtrail:LookupEvents`, `rbin:ListRules`, `rbin:GetRule`, `sts:GetCallerIdentity` |
+| Relationship checks (read-only) | `route53:ListHostedZones`, `route53:ListResourceRecordSets` (is a DNS record pointing at this Elastic IP?), `elasticloadbalancing:DescribeTargetGroups`, `elasticloadbalancing:DescribeTargetHealth` (is this instance serving traffic behind a load balancer?) |
 | Backup and restore | `ec2:CreateSnapshot`, `ec2:CreateVolume`, `ec2:RestoreSnapshotFromRecycleBin`, `ec2:StartInstances` |
-| Tagging (volumes, snapshots and instances only) | `ec2:CreateTags` (any keys only on create; afterwards `warden:*` keys only), `ec2:DeleteTags` (`warden:*` keys only: undo removes Warden's bookkeeping tags) |
+| Tagging (volumes, snapshots, instances and Elastic IPs only) | `ec2:CreateTags` (any keys only on create; afterwards `warden:*` keys only, e.g. `warden:quarantined-until` on an Elastic IP), `ec2:DeleteTags` (`warden:*` keys only: undo removes Warden's bookkeeping tags, e.g. `cancel_address_quarantine`) |
 | Encrypted volumes | `kms:CreateGrant`, `kms:Decrypt`, `kms:DescribeKey`, `kms:GenerateDataKeyWithoutPlaintext`, `kms:ReEncrypt*`, only when called **through EBS** (`kms:ViaService = ec2.*.amazonaws.com`), so `restore_volume` can recreate a volume encrypted with a customer-managed key |
 | Cleanup | `ec2:DeleteVolume`, `ec2:DeleteSnapshot`, `ec2:StopInstances`, `ec2:ReleaseAddress` |
 
