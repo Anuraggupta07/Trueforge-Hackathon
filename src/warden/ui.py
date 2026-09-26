@@ -118,8 +118,6 @@ def scan_ui(report: dict, mock: bool = False, console_url: str | None = None) ->
                 for f in act]
         whys = [_q(f.get("why") or "; ".join(f.get("reasons") or []), 180) for f in act]
         # TrueForge renders OpenUI without an action handler, so buttons would be dead: show what to TYPE instead.
-        says = [_tag(("approve " if f.get("verdict") == "act" else "explain ") + str(f.get("name") or f.get("resource_id")),
-                     "info" if f.get("reversible") else "neutral") for f in act]
         decide += [
             "decide = Card([dhdr, intro1, dtable, dbtns])",
             "dhdr = CardHeader(" + _q(f"Decide: {len(act)} item(s)") + ", \"Most urgent first\")",
@@ -127,7 +125,7 @@ def scan_ui(report: dict, mock: bool = False, console_url: str | None = None) ->
             "Warden's independent Watchdog re-checks it, then TrueForge shows you an Allow / Deny card. Nothing "
             "changes until you click Allow, and every item here can be undone.\")",
             "dtable = Table([Col(\"Resource\", " + _arr(names) + "), Col(\"Action\", " + _arr(actions)
-            + "), Col(\"Undo\", " + _arr(undo) + "), Col(\"To act, type\", " + _arr(says) + ")])",
+            + "), Col(\"Undo\", " + _arr(undo) + ")])",
             "t6 = TabItem(\"why\", \"Why it is safe\", [whysteps])",
             "whysteps = Steps(" + _arr(f"StepsItem({n}, {w})" for n, w in zip(names, whys)) + ")",
         ]
