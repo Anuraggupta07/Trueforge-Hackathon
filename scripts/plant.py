@@ -373,7 +373,7 @@ class Planter:
             self.out("Mock mode: you can scan right away (idle history is synthetic, CloudTrail is empty).")
             self.out("Clean up afterwards with: uv run python scripts/reset.py --yes (or restart the moto server)")
             return cleanable
-        self.out("Reminder: plant at least ~25 minutes before the demo scan. Warden ignores the idle server's "
+        self.out("Reminder: plant at least ~35 minutes before the demo scan. Warden ignores the idle server's "
                  "first 10 minutes (boot activity) and then needs CloudWatch data (5-minute periods, a few "
                  "minutes' delay); scanned earlier, it shows as 'review'. CloudTrail events can take up to "
                  "15 minutes to appear.")

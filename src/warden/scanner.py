@@ -16,9 +16,11 @@ from .aws import AwsClients, dry_run, error_code
 from .config import (
     TAG_BACKUP_OF,
     TAG_EXPIRES_AT,
+    TAG_HUMAN_UNDO_AT,
     TAG_QUARANTINED_UNTIL,
     TAG_RECYCLE,
     TAG_RECYCLE_VALUE,
+    TAG_RESTORED_FROM,
     Settings,
 )
 from .plan import ACTIONS, PlanItem, fingerprint, new_plan, save_plan
@@ -29,6 +31,11 @@ LEAK_PROBLEM = (
     "when terminated"
 )
 NO_METRICS_REASON = "no CloudWatch data yet for the lookback window"
+INSTANCE_STORE_REASON = "has instance-store volumes whose data is lost on stop - a human must confirm"
+# An idle verdict needs this many CPU and network datapoints, and at least half of those the window should have.
+MIN_IDLE_DATAPOINTS = 3
+MIN_IDLE_COVERAGE = 0.5
+HUMAN_UNDO_PREFIX = "a human undid Warden's action here"
 NO_OWNER_NOTE = "no CloudTrail event in the last 90 days (events can take up to 15 minutes to appear)"
 # Boot, cloud-init and user-data make a new instance look busy; ignore this long after launch.
 BOOT_WARMUP_MINUTES = 10
@@ -214,29 +221,40 @@ class _Context:
     """Evidence gathered once per scan (never scope-filtered)."""
 
     templates: list[dict] = field(default_factory=list)  # launch template versions
+    template_tags: dict[str, dict[str, str]] = field(default_factory=dict)  # template id -> its own tags
     leak_sources: list[dict] = field(default_factory=list)
     snapshot_to_amis: dict[str, list[dict]] = field(default_factory=dict)
+    snapshot_to_templates: dict[str, list[dict]] = field(default_factory=dict)
     ami_to_templates: dict[str, list[dict]] = field(default_factory=dict)
     ami_to_instances: dict[str, list[str]] = field(default_factory=dict)
     volume_ids: set[str] = field(default_factory=set)
     leaks: dict[tuple, dict] = field(default_factory=dict)
+    # First error code while listing volumes, AMIs or launch templates: what uses a snapshot is then unknown.
+    snapshot_evidence_error: str | None = None
+
+    def evidence_failed(self, err: Exception) -> str:
+        code = error_code(err)
+        if self.snapshot_evidence_error is None:
+            self.snapshot_evidence_error = code
+        return code
 
 
-def _load_templates(clients: AwsClients, notes: list[str]) -> list[dict]:
+def _load_templates(clients: AwsClients, ctx: _Context, notes: list[str]) -> list[dict]:
     versions: list[dict] = []
     try:
         templates = _paginate(clients.ec2, "describe_launch_templates", "LaunchTemplates")
     except Exception as err:
-        notes.append(f"launch templates unavailable ({error_code(err)}); leak detection skipped")
+        notes.append(f"launch templates unavailable ({ctx.evidence_failed(err)}); leak detection skipped")
         return versions
     for tpl in templates:
         tid = tpl.get("LaunchTemplateId")
+        ctx.template_tags[str(tid)] = tags_to_dict(tpl.get("Tags"))
         try:
             resp = clients.ec2.describe_launch_template_versions(
                 LaunchTemplateId=tid, Versions=["$Default", "$Latest"]
             )
         except Exception as err:
-            notes.append(f"{tid}: could not read template versions ({error_code(err)})")
+            notes.append(f"{tid}: could not read template versions ({ctx.evidence_failed(err)})")
             continue
         seen: set[int] = set()
         for ver in resp.get("LaunchTemplateVersions") or []:
@@ -271,11 +289,25 @@ def _leak_sources(versions: list[dict]) -> list[dict]:
     return sources
 
 
+def _index_template_snapshots(ctx: _Context) -> None:
+    """snapshot id -> launch template versions whose block devices create a disk from it."""
+    for ver in ctx.templates:
+        for bdm in (ver.get("LaunchTemplateData") or {}).get("BlockDeviceMappings") or []:
+            snap = (bdm.get("Ebs") or {}).get("SnapshotId")
+            if snap:
+                ctx.snapshot_to_templates.setdefault(snap, []).append({
+                    "id": ver.get("LaunchTemplateId"),
+                    "name": ver.get("LaunchTemplateName"),
+                    "version": int(ver.get("VersionNumber") or 0),
+                    "device": bdm.get("DeviceName"),
+                })
+
+
 def _load_amis(clients: AwsClients, ctx: _Context, notes: list[str]) -> None:
     try:
         images = _paginate(clients.ec2, "describe_images", "Images", Owners=["self"])
     except Exception as err:
-        notes.append(f"AMIs unavailable ({error_code(err)}); snapshots used by AMIs may be misjudged")
+        notes.append(f"AMIs unavailable ({ctx.evidence_failed(err)}); snapshots are held for review")
         return
     for image in images:
         ref = {"id": image.get("ImageId"), "name": sanitize_tags({"n": image.get("Name") or ""})["n"]}
@@ -302,8 +334,9 @@ def _all_instances(clients: AwsClients, notes: list[str]) -> list[dict]:
 
 def _build_context(clients: AwsClients, instances: list[dict], notes: list[str]) -> _Context:
     ctx = _Context()
-    ctx.templates = _load_templates(clients, notes)
+    ctx.templates = _load_templates(clients, ctx, notes)
     ctx.leak_sources = _leak_sources(ctx.templates)
+    _index_template_snapshots(ctx)
     _load_amis(clients, ctx, notes)
     for inst in instances:
         if (inst.get("State") or {}).get("Name") in ("terminated", "shutting-down"):
@@ -313,8 +346,45 @@ def _build_context(clients: AwsClients, instances: list[dict], notes: list[str])
     try:
         ctx.volume_ids = {v["VolumeId"] for v in _paginate(clients.ec2, "describe_volumes", "Volumes")}
     except Exception as err:
-        notes.append(f"could not list all volumes ({error_code(err)})")
+        notes.append(f"could not list all volumes ({ctx.evidence_failed(err)}); snapshots are held for review")
     return ctx
+
+
+def _instance_storage(clients: AwsClients, types: Iterable[str]) -> tuple[dict[str, bool], str | None]:
+    """{instance type: has instance-store volumes} for these types in one call (per 100 types), and the
+    error code if the lookup failed (then the map is empty and callers must fail closed)."""
+    wanted = sorted({t for t in types if t})
+    out: dict[str, bool] = {}
+    try:
+        for i in range(0, len(wanted), 100):
+            kwargs: dict[str, Any] = {"InstanceTypes": wanted[i:i + 100]}
+            while True:
+                resp = clients.ec2.describe_instance_types(**kwargs)
+                for info in resp.get("InstanceTypes") or []:
+                    out[str(info.get("InstanceType"))] = bool(info.get("InstanceStorageSupported"))
+                if not resp.get("NextToken"):
+                    break
+                kwargs["NextToken"] = resp["NextToken"]
+    except Exception as err:
+        return {}, error_code(err)
+    return out, None
+
+
+def _human_undo_reasons(resource_type: str, tags: dict[str, str], created: Any = None) -> list[str]:
+    """A human undid Warden's action on this resource (undo tools tag it): never propose it again.
+
+    Every undo tool writes warden:human-undo-at; volumes restored from a Warden backup also carry
+    warden:restored-from (older restores carry only that one)."""
+    lower = {str(k).strip().lower(): v for k, v in sanitize_tags(tags).items()}
+    present = [TAG_HUMAN_UNDO_AT] if TAG_HUMAN_UNDO_AT in lower else []
+    if resource_type == "volume" and TAG_RESTORED_FROM in lower:
+        present.append(TAG_RESTORED_FROM)
+    if not present:
+        return []
+    when = str(lower.get(TAG_HUMAN_UNDO_AT) or "").strip()[:40] or _iso(created) or "date unknown"
+    noun = "tag" if len(present) == 1 else "tags"
+    return [f"{HUMAN_UNDO_PREFIX} ({when}); Warden will not propose it again. "
+            f"Remove the {' and '.join(present)} {noun} to allow"]
 
 
 # --------------------------------------------------------------------------- relationships (DNS, load balancers)
@@ -453,6 +523,19 @@ def _leak_record(src: dict, region: str) -> dict:
     }
 
 
+def _standing_leaks(ctx: _Context, settings: Settings) -> None:
+    """Leaky templates in scope are reported even with no orphan right now (orphaned_volume_ids []), so the
+    leak does not vanish from the report once its disks are cleaned up. One record per template + device."""
+    reported = {(leak["launch_template_id"], leak["device_name"]) for leak in ctx.leaks.values()}
+    for src in ctx.leak_sources:
+        if (src["template_id"], src["device"]) in reported:
+            continue
+        if not in_scope(ctx.template_tags.get(str(src["template_id"]), {}), settings):
+            continue
+        reported.add((src["template_id"], src["device"]))
+        ctx.leaks[(src["template_id"], src["version"], src["device"])] = _leak_record(src, settings.region)
+
+
 def _volume_finding(vol: dict, settings: Settings, ctx: _Context, now: datetime) -> dict | None:
     tags = tags_to_dict(vol.get("Tags"))
     if not in_scope(tags, settings):
@@ -484,7 +567,7 @@ def _volume_finding(vol: dict, settings: Settings, ctx: _Context, now: datetime)
             f"{vid} <- launch template {src['template_id']} ({src['template_name']}) v{src['version']} "
             f"{src['device']} with DeleteOnTermination=false"
         )
-    reasons = keep_reasons(tags)
+    reasons = keep_reasons(tags) + _human_undo_reasons("volume", tags, vol.get("CreateTime"))
     if reasons:
         return _set_verdict(f, "keep", reasons)
     return _set_verdict(
@@ -532,7 +615,7 @@ def _snapshot_finding(
     if source:
         f["evidence"]["references"].append(f"source volume {source}")
 
-    reasons = keep_reasons(tags)
+    reasons = keep_reasons(tags) + _human_undo_reasons("snapshot", tags, snap.get("StartTime"))
     if reasons:
         return _set_verdict(f, "keep", reasons)
     chains = _ami_chain(sid, ctx)
@@ -541,6 +624,13 @@ def _snapshot_finding(
         return _set_verdict(
             f, "keep", [f"used by AMI: {c}; autoscaling/launches would break" for c in chains]
         )
+    templates = ctx.snapshot_to_templates.get(sid, [])
+    if templates:
+        f["evidence"]["references"].extend(
+            f"{sid} -> launch template {t['id']} ({t['name']}) v{t['version']} {t['device']}" for t in templates
+        )
+        labels = list(dict.fromkeys(f"{t['name']} ({t['id']})" for t in templates))
+        return _set_verdict(f, "keep", [f"used by launch template {label}; launches would fail" for label in labels])
     if snap.get("State") != "completed":
         return _set_verdict(f, "keep", [f"snapshot is {snap.get('State')}, not completed"])
     if _is_shared(clients, sid):
@@ -561,6 +651,8 @@ def _snapshot_finding(
         return _set_verdict(f, "keep", ["source volume still exists - may be its backup"])
     else:
         act_reason = "orphan: source volume is gone and no AMI uses it"
+    if ctx.snapshot_evidence_error is not None:  # fail closed: a user of this snapshot may have been missed
+        return _set_verdict(f, "review", [f"could not verify what uses this snapshot: {ctx.snapshot_evidence_error}"])
 
     if any(rule_covers(rule, tags) for rule in rules):
         return _set_verdict(f, "act", [act_reason, "Recycle Bin keeps it restorable"], "recycle_snapshot")
@@ -622,8 +714,12 @@ def _activity(
     out: dict[str, Any] = {
         "lookback_minutes": lookback,
         "window_start": _iso(start),
+        "observed_minutes": max(0, round(window_minutes)),
         "period_seconds": period,
+        # Whole periods in the observed window: what full CloudWatch coverage would return.
+        "expected_datapoints": max(1, int(window_minutes * 60 // period)),
         "datapoints": 0,
+        "network_datapoints": 0,
         "max_cpu_pct": None,
         "network_bytes_per_hour": None,
         "idle_cpu_pct": settings.idle_cpu_pct,
@@ -638,6 +734,7 @@ def _activity(
     # Divide by the time actually observed: datapoints exist only while the instance ran.
     observed_hours = max(len(net_in), len(net_out)) * period / 3600
     out["datapoints"] = len(cpu)
+    out["network_datapoints"] = max(len(net_in), len(net_out))
     out["max_cpu_pct"] = round(max(cpu), 2) if cpu else None
     if observed_hours:
         out["network_bytes_per_hour"] = round((sum(net_in) + sum(net_out)) / observed_hours, 1)
@@ -649,10 +746,22 @@ def _stop_protected(clients: AwsClients, instance_id: str) -> bool:
     return bool((resp.get("DisableApiStop") or {}).get("Value"))
 
 
+def _instance_store_problem(itype: str, storage: dict[str, bool] | None, storage_error: str | None) -> str | None:
+    """Why stopping this type could lose data (instance-store volumes), or None. Unknown means a problem."""
+    if storage_error is not None or storage is None or itype not in storage:
+        why = storage_error or "type not described"
+        return (f"could not check whether {itype or 'its instance type'} has instance-store volumes ({why}); "
+                "their data is lost on stop - a human must confirm")
+    return INSTANCE_STORE_REASON if storage[itype] else None
+
+
 def _instance_finding(
     clients: AwsClients, inst: dict, settings: Settings, now: datetime,
     lb_targets: dict[str, list[str]] | None = None,
+    storage: dict[str, bool] | None = None,
+    storage_error: str | None = None,
 ) -> dict | None:
+    """storage: {instance type: has instance-store volumes} from _instance_storage (None = not checked)."""
     tags = tags_to_dict(inst.get("Tags"))
     if not in_scope(tags, settings):
         return None
@@ -666,7 +775,7 @@ def _instance_finding(
     f["est_monthly_usd"] = pricing.instance_monthly_usd(itype, settings.region)
     f["warnings"].append("savings cover compute only; attached EBS volumes keep billing while stopped")
 
-    reasons = keep_reasons(tags)
+    reasons = keep_reasons(tags) + _human_undo_reasons("instance", tags, inst.get("LaunchTime"))
     if reasons:
         return _set_verdict(f, "keep", reasons)
     groups = (lb_targets or {}).get(iid) or []
@@ -684,18 +793,23 @@ def _instance_finding(
 
     activity = _activity(clients, iid, settings, now, launched=inst.get("LaunchTime"))
     f["evidence"]["activity"] = activity
-    if activity["max_cpu_pct"] is None:
+    cpu = activity["max_cpu_pct"]
+    if cpu is None:
         return _set_verdict(f, "review", [NO_METRICS_REASON])
     net = activity["network_bytes_per_hour"] or 0.0
-    if activity["max_cpu_pct"] < settings.idle_cpu_pct and net < settings.idle_network_bytes_per_hour:
-        return _set_verdict(
-            f, "act",
-            [f"idle: max CPU {activity['max_cpu_pct']}% and {net:,.0f} network bytes/hour "
-             f"over {settings.idle_lookback_minutes} minutes"],
-            "stop_instance",
-        )
+    if cpu >= settings.idle_cpu_pct or net >= settings.idle_network_bytes_per_hour:
+        return _set_verdict(f, "keep", [f"active: max CPU {cpu}%, {net:,.0f} network bytes/hour"])
+    # Idle so far - but "idle" must rest on enough evidence (thin or missing data fails closed).
+    window = f"over the last {activity['observed_minutes']} minutes (since {activity['window_start']})"
+    have = min(activity["datapoints"], activity["network_datapoints"])
+    expected = activity["expected_datapoints"]
+    if have < MIN_IDLE_DATAPOINTS or have < MIN_IDLE_COVERAGE * expected:
+        return _set_verdict(f, "review", [f"not enough CloudWatch data: {have} of {expected} datapoints {window}"])
+    problem = _instance_store_problem(itype, storage, storage_error)
+    if problem:
+        return _set_verdict(f, "review", [problem])
     return _set_verdict(
-        f, "keep", [f"active: max CPU {activity['max_cpu_pct']}%, {net:,.0f} network bytes/hour"]
+        f, "act", [f"idle: max CPU {cpu}% and {net:,.0f} network bytes/hour {window}"], "stop_instance"
     )
 
 
@@ -720,7 +834,7 @@ def _address_finding(
     f["est_monthly_usd"] = pricing.address_monthly_usd(settings.region)
     ip = addr.get("PublicIp")
     f["evidence"]["references"].append(f"public IP {ip}")
-    reasons = keep_reasons(tags)
+    reasons = keep_reasons(tags) + _human_undo_reasons("address", tags)
     if reasons:
         return _set_verdict(f, "keep", reasons)
     records = (dns or {}).get(str(ip or "").strip(), [])
@@ -870,6 +984,10 @@ def _age_phrase(finding: dict) -> str:
 
 def _why_act(finding: dict, settings: Settings) -> str:
     action = finding["action"]
+    leak = finding["evidence"].get("leak")
+    if action == "quarantine_volume" and leak:
+        return (f"Left behind by launch template {leak['launch_template_name']} (DeleteOnTermination=false) and "
+                "nothing uses it now; Warden will back it up first so you can restore it in one click.")
     if action == "quarantine_volume":
         return (f"Created{_age_phrase(finding)}, attached to nothing and nothing references it; Warden will back "
                 "it up first so you can restore it in one click.")
@@ -901,6 +1019,11 @@ def _why_review(finding: dict) -> str:
         return "AWS did not confirm a dry run of the cleanup, so Warden will not act until a human checks access."
     if NO_METRICS_REASON in reasons:
         return "There is no usage data for it yet, so Warden cannot tell whether it is idle."
+    if any(r.startswith("not enough CloudWatch data") for r in reasons):
+        return "It looks idle, but there is too little usage data to be sure, so a human should decide."
+    if INSTANCE_STORE_REASON in reasons:
+        return ("It looks idle, but its instance-store disks lose their data when it stops, so a human must "
+                "confirm first.")
     first = reasons[0] if reasons else "no clear evidence either way"
     return f"Warden cannot judge this safely on its own ({first}), so a human should decide."
 
@@ -911,6 +1034,10 @@ def _why_keep(finding: dict) -> str:
         return "It is in active use, so Warden leaves it alone."
     if first.startswith("used by AMI"):
         return "A machine image (AMI) is built from this snapshot, so deleting it would break future launches."
+    if first.startswith("used by launch template"):
+        return "A launch template creates disks from this snapshot, so deleting it would make launches fail."
+    if first.startswith(HUMAN_UNDO_PREFIX):
+        return first[0].upper() + first[1:] + "."
     if first.startswith("protected: "):
         first = first[len("protected: "):]
     return f"Warden will not touch it: {first}."
@@ -1003,6 +1130,7 @@ def scan(clients: AwsClients, settings: Settings, now: datetime | None = None) -
         "volume", volumes, "VolumeId", lambda v: _prod_guard(_volume_finding(v, settings, ctx, now), v),
         findings, notes,
     )
+    _standing_leaks(ctx, settings)
 
     snapshots = _list("snapshots", lambda: _paginate(ec2, "describe_snapshots", "Snapshots", OwnerIds=["self"]), notes)
     _evaluate(
@@ -1012,15 +1140,24 @@ def scan(clients: AwsClients, settings: Settings, now: datetime | None = None) -
 
     running = [i for i in all_instances if (i.get("State") or {}).get("Name") == "running"]
     lb_targets: dict[str, list[str]] = {}
+    storage: dict[str, bool] = {}
+    storage_error: str | None = None
     if running:
         try:
             lb_targets = _lb_index(clients)
         except Exception as err:
             notes.append(f"load balancer target groups unavailable ({error_code(err)}); "
                          "instances behind a load balancer may be misjudged")
+        # One DescribeInstanceTypes call per scan for the distinct in-scope types (instance-store check).
+        types = [i.get("InstanceType") or "" for i in running if in_scope(tags_to_dict(i.get("Tags")), settings)]
+        storage, storage_error = _instance_storage(clients, types)
+        if storage_error is not None:
+            notes.append(f"instance types unavailable ({storage_error}); idle instances held for review "
+                         "(instance-store data would be lost on stop)")
     _evaluate(
         "instance", running, "InstanceId",
-        lambda i: _prod_guard(_instance_finding(clients, i, settings, now, lb_targets), i), findings, notes,
+        lambda i: _prod_guard(_instance_finding(clients, i, settings, now, lb_targets, storage, storage_error), i),
+        findings, notes,
     )
 
     addresses = _list("addresses", lambda: _paginate(ec2, "describe_addresses", "Addresses"), notes)

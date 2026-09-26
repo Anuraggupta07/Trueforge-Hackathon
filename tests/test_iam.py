@@ -94,6 +94,127 @@ def test_create_tags_cannot_rewrite_protection_tags():  # S15
         assert warden_only or on_create <= {"CreateSnapshot", "CreateVolume"} and on_create, s["Sid"]
 
 
+PROTECT_KEY = "warden:protect"
+
+
+def test_protect_tag_writes_are_explicitly_denied():  # finding 14: warden:protect sits inside warden:*
+    denies = [
+        s for s in STATEMENTS
+        if s["Effect"] == "Deny" and {"ec2:CreateTags", "ec2:DeleteTags"} <= set(_actions(s))
+    ]
+    assert denies, "no Deny on CreateTags/DeleteTags"
+    (deny,) = denies
+    assert deny["Resource"] == "*"
+    assert deny["Condition"] == {"ForAnyValue:StringEqualsIgnoreCase": {"aws:TagKeys": [PROTECT_KEY]}}
+
+
+def _condition_holds(op: str, key: str, want, ctx: dict) -> bool:
+    """Evaluate one condition operator against a request context (only the operators this policy uses)."""
+    wants = [str(w) for w in (want if isinstance(want, list) else [want])]
+    have = ctx.get(key)
+    if op == "Null":
+        return (have is None) == (wants[0] == "true")
+    if have is None:
+        return op.startswith("ForAllValues:")  # IAM: ForAllValues over an empty set is true, anything else false
+    values = have if isinstance(have, list) else [have]
+    if op == "StringEquals":
+        return any(v in wants for v in values)
+    if op == "ForAllValues:StringLike":
+        return all(any(fnmatch.fnmatchcase(v, w) for w in wants) for v in values)
+    if op == "ForAnyValue:StringEqualsIgnoreCase":
+        return any(v.lower() in {w.lower() for w in wants} for v in values)
+    if op == "StringLike":
+        return any(fnmatch.fnmatchcase(v, w) for v in values for w in wants)
+    if op == "Bool":
+        return any(v.lower() == wants[0].lower() for v in values)
+    raise AssertionError(f"unexpected operator {op}")
+
+
+def _tag_request_allowed(action: str, keys: list[str], resource: str, create_action: str | None = None) -> bool:
+    """Explicit Deny wins, then any matching Allow (IAM evaluation for one tag request)."""
+    ctx: dict = {"aws:TagKeys": keys or None}
+    if create_action:
+        ctx["ec2:CreateAction"] = create_action
+
+    def matches(stmt: dict) -> bool:
+        resources = stmt["Resource"] if isinstance(stmt["Resource"], list) else [stmt["Resource"]]
+        if not any(fnmatch.fnmatch(action, a) for a in _actions(stmt)):
+            return False
+        if not any(r == "*" or fnmatch.fnmatch(resource, r) for r in resources):
+            return False
+        return all(
+            _condition_holds(op, key, want, ctx)
+            for op, pairs in (stmt.get("Condition") or {}).items() for key, want in pairs.items()
+        )
+
+    if any(matches(s) for s in STATEMENTS if s["Effect"] == "Deny"):
+        return False
+    return any(matches(s) for s in STATEMENTS if s["Effect"] == "Allow")
+
+
+VOLUME_ARN = "arn:aws:ec2:us-east-1:123456789012:volume/vol-1"
+
+
+@pytest.mark.parametrize("action", ["ec2:CreateTags", "ec2:DeleteTags"])
+@pytest.mark.parametrize("keys", [[PROTECT_KEY], ["Warden:Protect"], ["WARDEN:PROTECT"], ["warden:stopped-at", PROTECT_KEY]])
+def test_warden_cannot_write_or_remove_the_protect_tag(action, keys):  # finding 14
+    for resource in (VOLUME_ARN, "arn:aws:ec2:us-east-1::snapshot/snap-1",
+                     "arn:aws:ec2:us-east-1:123456789012:instance/i-1",
+                     "arn:aws:ec2:us-east-1:123456789012:elastic-ip/eipalloc-1"):
+        assert not _tag_request_allowed(action, keys, resource), (action, keys, resource)
+
+
+def test_protect_tag_cannot_be_planted_on_create():  # finding 14: tag-on-create goes through ec2:CreateTags too
+    assert not _tag_request_allowed("ec2:CreateTags", ["Name", PROTECT_KEY], VOLUME_ARN, create_action="CreateVolume")
+    assert _tag_request_allowed("ec2:CreateTags", ["Name", "warden:restored-from"], VOLUME_ARN, create_action="CreateVolume")
+
+
+@pytest.mark.parametrize("action", ["ec2:CreateTags", "ec2:DeleteTags"])
+def test_warden_bookkeeping_tags_still_allowed(action):  # the new Deny must not block Warden's own tags
+    for key in ("warden:stopped-at", "warden:recycle", "warden:quarantined-until", "warden:human-undo-at"):
+        assert _tag_request_allowed(action, [key], VOLUME_ARN), key
+    assert not _tag_request_allowed(action, ["Name"], VOLUME_ARN)  # still only warden:* keys
+
+
+_OPERATORS = {
+    "StringEquals", "StringNotEquals", "StringEqualsIgnoreCase", "StringNotEqualsIgnoreCase", "StringLike",
+    "StringNotLike", "NumericEquals", "NumericLessThan", "NumericGreaterThan", "Bool", "Null", "ArnLike", "ArnEquals",
+    "DateLessThan", "DateGreaterThan", "IpAddress",
+}
+_MULTIVALUED_KEYS = {"aws:TagKeys"}
+
+
+def test_policy_is_valid_iam_grammar():
+    assert set(POLICY) == {"Version", "Statement"} and POLICY["Version"] == "2012-10-17"
+    assert isinstance(STATEMENTS, list) and STATEMENTS
+    sids = [s.get("Sid") for s in STATEMENTS]
+    assert len(set(sids)) == len(sids)
+    for s in STATEMENTS:
+        sid = s.get("Sid")
+        assert isinstance(sid, str) and re.fullmatch(r"[A-Za-z0-9]+", sid), sid
+        assert set(s) <= {"Sid", "Effect", "Action", "Resource", "Condition"}, sid
+        assert {"Effect", "Action", "Resource"} <= set(s), sid
+        assert s["Effect"] in ("Allow", "Deny"), sid
+        acts = _actions(s)
+        assert acts and all(isinstance(a, str) and re.fullmatch(r"[a-z0-9-]+:[A-Za-z0-9*]+", a) for a in acts), sid
+        assert len(set(acts)) == len(acts), sid
+        resources = s["Resource"] if isinstance(s["Resource"], list) else [s["Resource"]]
+        assert resources and all(r == "*" or re.fullmatch(r"arn:aws:[a-z0-9-]+:[^:]*:[^:]*:.+", r) for r in resources), sid
+        for op, pairs in (s.get("Condition") or {}).items():
+            prefix, _, base = op.rpartition(":") if op.startswith(("ForAllValues:", "ForAnyValue:")) else ("", "", op)
+            base = base[: -len("IfExists")] if base.endswith("IfExists") else base
+            assert base in _OPERATORS, (sid, op)
+            assert isinstance(pairs, dict) and pairs, (sid, op)
+            for key, want in pairs.items():
+                assert re.fullmatch(r"[a-z0-9]+:[A-Za-z0-9]+(/[A-Za-z0-9_.:/=+@-]+)?", key), (sid, key)
+                # Set operators only make sense on multivalued keys; single-valued keys must not use them.
+                assert bool(prefix) == (key in _MULTIVALUED_KEYS and base != "Null"), (sid, op, key)
+                values = want if isinstance(want, list) else [want]
+                assert values and all(isinstance(v, str) for v in values), (sid, key)
+                if base in ("Bool", "Null"):
+                    assert values in (["true"], ["false"]), (sid, key)
+
+
 def _deny_conditions() -> list[dict]:
     return [
         s["Condition"] for s in STATEMENTS

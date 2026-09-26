@@ -142,6 +142,22 @@
       "Resource": "*"
     },
     {
+      "Sid": "DenyProtectTagWrites",
+      "Effect": "Deny",
+      "Action": [
+        "ec2:CreateTags",
+        "ec2:DeleteTags"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "ForAnyValue:StringEqualsIgnoreCase": {
+          "aws:TagKeys": [
+            "warden:protect"
+          ]
+        }
+      }
+    },
+    {
       "Sid": "DenyDestructiveOnProdByEnvTag",
       "Effect": "Deny",
       "Action": [

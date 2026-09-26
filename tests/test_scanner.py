@@ -4,13 +4,22 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from botocore.exceptions import ClientError
 
 from warden import audit, scanner
-from warden.config import TAG_BACKUP_OF, TAG_EXPIRES_AT, TAG_QUARANTINED_AT, TAG_QUARANTINED_UNTIL, load_settings
+from warden.config import (
+    TAG_BACKUP_OF,
+    TAG_EXPIRES_AT,
+    TAG_HUMAN_UNDO_AT,
+    TAG_QUARANTINED_AT,
+    TAG_QUARANTINED_UNTIL,
+    TAG_RESTORED_FROM,
+    load_settings,
+)
 from warden.plan import load_plan
 from warden.policy import INJECTION_REASON
 
@@ -112,8 +121,9 @@ def world(aws):
     ids["busy_i"] = _instance(ec2, ami, _tags(Name="busy"))
     # Metrics after the boot warm-up (moto launches instances "now"); scan with SCAN_AHEAD to see them.
     after_boot = now + timedelta(minutes=scanner.BOOT_WARMUP_MINUTES + 5)
-    _put_metrics(cw, ids["idle_i"], cpu=1.5, net=1000.0, when=after_boot)
-    _put_metrics(cw, ids["busy_i"], cpu=80.0, net=1000.0, when=after_boot)
+    for minutes in (12, 17, 22, 27):  # one idle datapoint per 5-minute period: enough evidence to call it idle
+        _put_metrics(cw, ids["idle_i"], cpu=1.5, net=1000.0, when=now + timedelta(minutes=minutes))
+    _put_metrics(cw, ids["busy_i"], cpu=80.0, net=1000.0, when=after_boot)  # one busy datapoint is enough
 
     free = ec2.allocate_address(Domain="vpc", TagSpecifications=[{"ResourceType": "elastic-ip", "Tags": DEMO}])
     ids["free_eip"], ids["free_ip"] = free["AllocationId"], free["PublicIp"]
@@ -807,3 +817,167 @@ def test_recycle_rules_costs_one_call_when_rbin_fails(aws, monkeypatch):  # LEAD
 
     monkeypatch.setattr(aws.rbin, "list_rules", broken)
     assert scanner.recycle_rules(aws) == [] and len(calls) == 1
+
+
+# ---------------------------------------------------------------- confirmed review findings (round 2)
+
+
+UNDO_AT = "2026-09-26T10:00:00Z"
+UNDO_REASON = (
+    f"a human undid Warden's action here ({UNDO_AT}); Warden will not propose it again. "
+    f"Remove the {TAG_HUMAN_UNDO_AT} tag to allow"
+)
+
+
+def _idle_history(cw, instance_id: str, now: datetime, minutes=(12, 17, 22, 27)) -> None:
+    """One idle datapoint per 5-minute period after the boot warm-up (scan with SCAN_AHEAD)."""
+    for m in minutes:
+        _put_metrics(cw, instance_id, cpu=1.5, net=1000.0, when=now + timedelta(minutes=m))
+
+
+def test_snapshot_used_by_launch_template_is_kept(aws, scoped, monkeypatch):  # review #11
+    _rb(monkeypatch, True)
+    sid = _snapshot(aws.ec2, _tags(Name="seed-data"))
+    lt = aws.ec2.create_launch_template(
+        LaunchTemplateName="data-seeded",
+        LaunchTemplateData={"ImageId": _any_ami(aws.ec2), "BlockDeviceMappings": [
+            {"DeviceName": "/dev/sdg", "Ebs": {"SnapshotId": sid, "DeleteOnTermination": True}}]},
+    )["LaunchTemplate"]["LaunchTemplateId"]
+    f = _by_id(scanner.scan(aws, scoped))[sid]
+    assert (f["verdict"], f["action"], f["tier"]) == ("keep", None, "protected")
+    assert f["reasons"] == [f"used by launch template data-seeded ({lt}); launches would fail"]
+    assert any(lt in r and "/dev/sdg" in r for r in f["evidence"]["references"])
+    assert "launch template" in f["why"]
+
+
+def test_human_undo_tag_means_keep_for_every_type(aws, scoped, monkeypatch):  # review #7 / #25
+    _rb(monkeypatch, True)
+    undo = {TAG_HUMAN_UNDO_AT: UNDO_AT}
+    vid = _volume(aws.ec2, _tags(**undo))
+    sid = _snapshot(aws.ec2, _tags(**undo))
+    alloc, _ = _eip(aws, **undo)
+    iid = _instance(aws.ec2, _any_ami(aws.ec2), _tags(**undo))
+    now = datetime.now(timezone.utc)
+    _idle_history(aws.cloudwatch, iid, now)
+    report = scanner.scan(aws, scoped, now=now + SCAN_AHEAD)
+    f = _by_id(report)
+    for rid in (vid, sid, alloc, iid):
+        assert (f[rid]["verdict"], f[rid]["action"], f[rid]["tier"]) == ("keep", None, "protected"), rid
+        assert f[rid]["reasons"] == [UNDO_REASON], rid
+        assert f[rid]["why"].startswith("A human undid Warden's action here"), rid
+        assert rid not in report["summary"]["decision_list"]
+
+
+def test_restored_volume_is_not_re_proposed(aws, scoped, monkeypatch):  # review #7 / #25
+    _rb(monkeypatch, True)
+    legacy = _volume(aws.ec2, _tags(**{TAG_RESTORED_FROM: "snap-0123"}))
+    both = _volume(aws.ec2, _tags(**{TAG_RESTORED_FROM: "snap-0123", TAG_HUMAN_UNDO_AT: UNDO_AT}))
+    f = _by_id(scanner.scan(aws, scoped))
+    assert (f[legacy]["verdict"], f[legacy]["tier"]) == ("keep", "protected")
+    assert f[legacy]["reasons"][0].startswith("a human undid Warden's action here (")
+    assert f[legacy]["reasons"][0].endswith(f"Remove the {TAG_RESTORED_FROM} tag to allow")
+    assert f[both]["reasons"] == [
+        f"a human undid Warden's action here ({UNDO_AT}); Warden will not propose it again. "
+        f"Remove the {TAG_HUMAN_UNDO_AT} and {TAG_RESTORED_FROM} tags to allow"
+    ]
+
+
+def test_leaked_disk_why_names_the_leaking_template(aws, scoped, world, monkeypatch):  # review #27
+    _rb(monkeypatch, True)
+    f = _by_id(scanner.scan(aws, scoped))
+    why = f[world["leak_vol"]]["why"]
+    assert why.startswith("Left behind by launch template leaky-web (DeleteOnTermination=false)")
+    assert "nothing uses it now" in why and "back it up first" in why
+    assert "nothing references it" not in why
+    assert "nothing references it" in f[world["plain_vol"]]["why"]  # no leak: unchanged
+
+
+def test_idle_instance_with_instance_store_is_review(aws, scoped, monkeypatch):  # review #10
+    _rb(monkeypatch, True)
+    now = datetime.now(timezone.utc)
+    ami = _any_ami(aws.ec2)
+    nvme = aws.ec2.run_instances(
+        ImageId=ami, MinCount=1, MaxCount=1, InstanceType="m5d.large",
+        TagSpecifications=[{"ResourceType": "instance", "Tags": _tags(Name="nvme-worker")}],
+    )["Instances"][0]["InstanceId"]
+    plain = [_instance(aws.ec2, ami, _tags(Name=f"worker-{i}")) for i in range(2)]
+    for iid in [nvme, *plain]:
+        _idle_history(aws.cloudwatch, iid, now)
+    calls: list[dict] = []
+    real = aws.ec2.describe_instance_types
+    monkeypatch.setattr(aws.ec2, "describe_instance_types", lambda **kw: calls.append(kw) or real(**kw))
+    f = _by_id(scanner.scan(aws, scoped, now=now + SCAN_AHEAD))
+    assert scanner.INSTANCE_STORE_REASON == "has instance-store volumes whose data is lost on stop - a human must confirm"
+    assert (f[nvme]["verdict"], f[nvme]["action"], f[nvme]["tier"]) == ("review", None, "needs_review")
+    assert f[nvme]["reasons"] == [scanner.INSTANCE_STORE_REASON]
+    assert all(f[i]["verdict"] == "act" for i in plain)
+    assert len(calls) == 1 and sorted(calls[0]["InstanceTypes"]) == ["m5d.large", "t3.micro"]  # once per scan
+
+
+def test_instance_types_unavailable_holds_idle_instances_for_review(aws, scoped, world, monkeypatch):  # review #10
+    _rb(monkeypatch, True)
+    monkeypatch.setattr(aws.ec2, "describe_instance_types", _raise("UnauthorizedOperation"))
+    report = scanner.scan(aws, scoped, now=datetime.now(timezone.utc) + SCAN_AHEAD)
+    f = _by_id(report)
+    idle = f[world["idle_i"]]
+    assert (idle["verdict"], idle["action"]) == ("review", None)
+    assert "instance-store" in idle["reasons"][0] and "UnauthorizedOperation" in idle["reasons"][0]
+    assert f[world["busy_i"]]["verdict"] == "keep"  # activity still decides for busy instances
+    assert any("instance types" in n and "UnauthorizedOperation" in n for n in report["notes"])
+
+
+@pytest.mark.parametrize(
+    "method", ["describe_volumes", "describe_images", "describe_launch_templates", "describe_launch_template_versions"]
+)
+def test_snapshot_verdict_fails_closed_without_evidence(aws, scoped, world, monkeypatch, method):  # review #9
+    _rb(monkeypatch, True)
+    _break(monkeypatch, aws.ec2, method)
+    f = _by_id(scanner.scan(aws, scoped))
+    for key in ("orphan_snap", "expired_backup"):
+        snap = f[world[key]]
+        assert (snap["verdict"], snap["action"]) == ("review", None), key
+        assert snap["reasons"] == ["could not verify what uses this snapshot: AccessDenied"], key
+    assert f[world["fresh_backup"]]["verdict"] == "keep"  # keep stays keep
+
+
+def test_idle_stop_needs_enough_cloudwatch_data(aws, scoped, monkeypatch):  # review #8
+    _rb(monkeypatch, True)
+    now = datetime.now(timezone.utc)
+    ami = _any_ami(aws.ec2)
+    thin = _instance(aws.ec2, ami, _tags(Name="thin"))
+    _put_metrics(aws.cloudwatch, thin, cpu=1.5, net=1000.0, when=now + timedelta(minutes=15))
+    cpu_only = _instance(aws.ec2, ami, _tags(Name="cpu-only"))
+    dims = [{"Name": "InstanceId", "Value": cpu_only}]
+    for m in (12, 17, 22, 27):
+        aws.cloudwatch.put_metric_data(Namespace="AWS/EC2", MetricData=[{
+            "MetricName": "CPUUtilization", "Dimensions": dims, "Timestamp": now + timedelta(minutes=m), "Value": 1.0}])
+    f = _by_id(scanner.scan(aws, scoped, now=now + SCAN_AHEAD))
+    assert (f[thin]["verdict"], f[thin]["action"]) == ("review", None)
+    assert re.match(r"not enough CloudWatch data: 1 of [34] datapoints over the last", f[thin]["reasons"][0])
+    assert f[cpu_only]["verdict"] == "review"  # missing network data is not "idle"
+    assert f[cpu_only]["reasons"][0].startswith("not enough CloudWatch data: 0 of ")
+
+
+def test_idle_reason_states_the_observed_window(aws, scoped, world, monkeypatch):  # review #8
+    _rb(monkeypatch, True)
+    idle = _by_id(scanner.scan(aws, scoped, now=datetime.now(timezone.utc) + SCAN_AHEAD))[world["idle_i"]]
+    assert idle["verdict"] == "act"
+    reason = idle["reasons"][0]
+    assert str(scoped.idle_lookback_minutes) not in reason  # the setting, not what was observed
+    assert re.search(r"over the last (19|20) minutes \(since \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\)$", reason), reason
+
+
+def test_scoped_leaky_template_is_reported_without_orphans(aws, scoped, monkeypatch):  # review #21
+    _rb(monkeypatch, True)
+    ami = _any_ami(aws.ec2)
+    bdm = [{"DeviceName": "/dev/sdf", "Ebs": {"VolumeSize": 5, "DeleteOnTermination": False}}]
+    lt = aws.ec2.create_launch_template(
+        LaunchTemplateName="leaky-scoped", LaunchTemplateData={"ImageId": ami, "BlockDeviceMappings": bdm},
+        TagSpecifications=[{"ResourceType": "launch-template", "Tags": DEMO}],
+    )["LaunchTemplate"]["LaunchTemplateId"]
+    aws.ec2.create_launch_template(  # leaky too, but not in scope
+        LaunchTemplateName="leaky-other", LaunchTemplateData={"ImageId": ami, "BlockDeviceMappings": bdm},
+    )
+    report = scanner.scan(aws, scoped)
+    assert [(x["launch_template_id"], x["orphaned_volume_ids"]) for x in report["leaks"]] == [(lt, [])]
+    assert "DeleteOnTermination" in report["leaks"][0]["fix_cli"]

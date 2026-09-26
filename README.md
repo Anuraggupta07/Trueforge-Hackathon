@@ -142,6 +142,7 @@ Then open **http://localhost:8790 → Agents → warden** and type **"Scan for w
 - **PowerShell:** set the variable first: `$env:OUTBOUND_URL_ALLOWED_HOSTS='["127.0.0.1"]'; npx @truefoundry/trueforge@latest`
 - **Clean up:** `uv run python scripts/reset.py --yes` (only deletes `warden:demo=true` resources)
 - **Tests:** `uv run python -m pytest -q`
+- **Windows/OneDrive:** if `uv sync` fails with a hardlink error, run `UV_LINK_MODE=copy uv sync`
 
 ---
 
@@ -190,7 +191,7 @@ AWS credentials stay inside the Warden server. The sandbox only runs analysis co
 | Criterion | How |
 |---|---|
 | **Reach real systems** | A custom MCP server makes real AWS API calls (EC2, CloudWatch, CloudTrail, Recycle Bin, Route 53, ELBv2) under a least-privilege IAM policy ([iam/](iam/)) |
-| **Execute safely** | Proof scripts and the change record run as code in the Daytona sandbox; every change is plan-locked, Watchdog-signed, human-approved and dry-run checked |
+| **Execute safely** | Proof scripts and the change record run as code in the Daytona sandbox; every cleanup action is plan-locked, Watchdog-signed, human-approved and dry-run checked; undo actions are human-approved and only work on resources Warden itself changed |
 | **Recover from failure** | Receipts for every call, one-click undo, a live rollback countdown, and "check the receipt" after a timeout |
 | **Know when to stop and ask** | Review tiers, one-item approvals for permanent steps, the quarantine window, the freeze switch, and Watchdog blocks that can't be bypassed |
 | **Keep context** | The locked plan, receipts and the ledger; "what happened to X?" is answered instantly from the log |
@@ -199,11 +200,22 @@ AWS credentials stay inside the Warden server. The sandbox only runs analysis co
 
 ## Honest notes
 
-- **Simulated AWS.** The team's AWS account stayed in `accountPlanStatus: NOT_STARTED`, and EC2 returned `OptInRequired` in every region, so the demo uses [moto](https://github.com/getmoto/moto) as a local AWS simulator. `src/warden/mock.py` fills moto's gaps openly: a simulated Recycle Bin, synthetic idle CPU data for the idle server, and instances reported as launched 2 hours earlier. Warden shows *"Simulated AWS"* and `aws_mode: MOCK`. Every safety check, sign-off, receipt and undo path is the same code.
+- **Simulated AWS.** The team's AWS account stayed in `accountPlanStatus: NOT_STARTED`, and EC2 returned `OptInRequired` in every region, so the demo uses [moto](https://github.com/getmoto/moto) as a local AWS simulator. `src/warden/mock.py` fills moto's gaps openly: a simulated Recycle Bin, synthetic idle CPU data for the idle server, and instances reported as launched 2 hours earlier. Warden shows *"Simulated AWS"* and `aws_mode: MOCK`. Every safety check, sign-off, receipt and undo path is the same code; the one lock moto cannot enforce is the AWS IAM policy (the second lock), which only real AWS applies.
 - **The quarantine window is compressed for the demo:** 5 minutes (`WARDEN_QUARANTINE_MINUTES=5`); the production default is 7 days.
 - **The relationship check is direct links, not a full graph:** snapshot → image → template, server → load balancer, IP → DNS.
 - **The Watchdog is independent code, not an independent machine.** It runs in the same server with the same AWS identity. Its independence comes from a separate code path, its own AWS reads and a signed, single-use token.
 - **Savings are list-price estimates**, not billing data.
+
+### Known limitations
+
+Warden is honest about what it does not do yet:
+
+- **One region and one account per run.** Multi-account (AWS Organizations) is on the roadmap.
+- **Four resource types.** RDS, S3, load balancers, NAT gateways and GPUs are not scanned yet.
+- **Idle means "no CPU or network activity in the look-back window".** A server that runs a job once a month needs a look-back longer than a month (the production default is 30 days), or a `dr` / `env=production` tag.
+- **Tags are the main protection signal.** Warden adds name heuristics (`prod`, `prd`, `live`) and "still in use" checks, but an untagged, unnamed production resource that looks idle can still be proposed. The Watchdog, the human approval and the undo window are there for exactly that case.
+- **Releasing an IP is permanent.** Warden waits for the quarantine window and asks separately, but it cannot get an IP back once another account takes it.
+- **The ledger is tamper-evident, not tamper-proof.** Someone who can rewrite all of Warden's state files consistently can still forge history.
 
 <details>
 <summary><b>More technical detail</b></summary>

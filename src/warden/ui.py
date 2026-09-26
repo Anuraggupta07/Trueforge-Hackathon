@@ -58,6 +58,11 @@ def _button(label: str, message: str, variant: str = "secondary") -> str:
     return f"Button({_q(label)}, Action([@ToAssistant({_q(message, 400)})]), {_q(variant)})"
 
 
+def _open_button(label: str, url: str) -> str:
+    """A button that opens a URL (only Warden's own local console URL is ever passed here)."""
+    return f"Button({_q(label)}, Action([@OpenUrl({_q(url, 300)})]), \"secondary\")"
+
+
 def _kpi(name: str, label: str, value: str, note: str) -> str:
     return (f"{name} = Card([TextContent({_q(label)}, \"small\"), TextContent({_q(value)}, \"large-heavy\"), "
             f"TextContent({_q(note)}, \"small\")])")
@@ -75,7 +80,17 @@ def _program(root_children: list[str], lines: list[str]) -> str:
     return "\n".join([f"root = Stack({_arr(root_children)}, \"column\", \"l\")", *lines])
 
 
-def scan_ui(report: dict, mock: bool = False) -> str:
+def _savings_by_type(items: list[dict]) -> tuple[list[str], list[str]]:
+    """Monthly savings grouped by resource type, for a single stacked bar."""
+    totals: dict[str, float] = {}
+    for f in items:
+        label = TYPE_LABELS.get(f.get("resource_type"), str(f.get("resource_type")))
+        totals[label] = totals.get(label, 0.0) + float(f.get("est_monthly_usd") or 0)
+    ordered = sorted(totals.items(), key=lambda kv: -kv[1])
+    return [_q(k) for k, _ in ordered], [_num(v) for _, v in ordered]
+
+
+def scan_ui(report: dict, mock: bool = False, console_url: str | None = None) -> str:
     """Scan report -> KPI cards + tabs (decide / refused / leaks / savings / how it works)."""
     findings = report.get("findings") or []
     summary = report.get("summary") or {}
@@ -83,18 +98,21 @@ def scan_ui(report: dict, mock: bool = False) -> str:
     plan_id = report.get("plan_id", "")
     act = [f for f in findings if f.get("verdict") in ("act", "review")]
     act.sort(key=lambda f: (f.get("tier") != "needs_review", -(f.get("est_monthly_usd") or 0)))
-    keep = [f for f in findings if f.get("verdict") == "keep"]
+    keep_all = [f for f in findings if f.get("verdict") == "keep"]
+    # Warden's own unexpired backups are not refusals; they live in the rollback window instead.
+    backups = [f for f in keep_all if any(str(r).startswith("Warden backup of") for r in f.get("reasons") or [])]
+    keep = [f for f in keep_all if f not in backups]
     leaks = report.get("leaks") or []
 
     lines = [
-        f"hdr = CardHeader(\"Warden · cloud waste report\", "
+        f"hdr = CardHeader(\"🛡️ Warden · cloud waste report\", "
         f"{_q(f'Account {report.get('account_id')} · {report.get('region')} · scope {report.get('scope')} · plan {plan_id}', 220)})",
         "kpis = Stack([k1, k2, k3, k4, k5], \"row\", \"m\", \"stretch\", \"start\", true)",
-        _kpi("k1", "Monthly waste found", _money(summary.get("est_monthly_savings_usd")), "list-price estimate"),
-        _kpi("k2", "Safe & reversible", str(tiers.get("safe_reversible", 0)), "one approval per batch"),
-        _kpi("k3", "Needs your review", str(tiers.get("needs_review", 0)), "irreversible or unclear"),
-        _kpi("k4", "Refused (protected)", str(tiers.get("protected", 0)), "Warden will not touch these"),
-        _kpi("k5", "Leaks found", str(len(leaks)), "sources that keep creating waste"),
+        _kpi("k1", "💰 Monthly waste", _money(summary.get("est_monthly_savings_usd")), "list-price estimate"),
+        _kpi("k2", "✅ Safe & reversible", str(tiers.get("safe_reversible", 0)), "one approval per batch"),
+        _kpi("k3", "🙋 Needs your review", str(tiers.get("needs_review", 0)), "irreversible or unclear"),
+        _kpi("k4", "🛡️ Refused", str(len(keep)), "Warden will not touch these"),
+        _kpi("k5", "🔧 Leaks", str(len(leaks)), "sources that keep creating waste"),
         "tabs = Tabs([t5, t4, t3, t6, t2])",
     ]
 
@@ -116,8 +134,9 @@ def scan_ui(report: dict, mock: bool = False) -> str:
         decide += [
             "decide = Card([dhdr, intro1, dtable, dbtns])",
             "dhdr = CardHeader(" + _q(f"Decide: {len(act)} item(s)") + ", \"Most urgent first\")",
-            "intro1 = TextContent(\"Each click only REQUESTS an action: Warden's independent Watchdog re-checks it, "
-            "then TrueForge shows you an Allow / Deny card. Nothing changes before you click Allow.\", \"small\")",
+            "intro1 = Callout(\"success\", \"You stay in control\", \"Each button only REQUESTS an action. Warden's "
+            "independent Watchdog re-checks it, then TrueForge shows you an Allow / Deny card. Nothing changes until "
+            "you click Allow, and every item here can be undone.\")",
             "dtable = Table([Col(\"Resource\", " + _arr(names) + "), Col(\"Action\", " + _arr(actions)
             + "), Col(\"Undo\", " + _arr(undo) + "), Col(\"\", "
             + _arr(btns) + ", \"action\")])",
@@ -128,7 +147,9 @@ def scan_ui(report: dict, mock: bool = False) -> str:
         batch = [_button("Request approval for all safe & reversible items",
                          f"Approve plan {plan_id}: every safe & reversible item ({', '.join(safe_ids)}), "
                          "batched by action, one Watchdog sign-off and one approval per batch", "primary")] if safe_ids else []
-        batch.append(_button("Show the rollback window", "Show the rollback window"))
+        batch.append(_button("⏳ Rollback window", "Show the rollback window"))
+        if console_url:
+            batch.append(_open_button("Open full dashboard ↗", console_url))
         decide.append("dbtns = Buttons(" + _arr(batch) + ")")
     else:
         decide += ["decide = Card([none1])", "t6 = TabItem(\"why\", \"Why it is safe\", [none6])",
@@ -139,7 +160,8 @@ def scan_ui(report: dict, mock: bool = False) -> str:
     if keep:
         lines += [
             "t2 = TabItem(\"refused\", " + _q(f"Refused ({len(keep)})") + ", [intro2, ptable])",
-            "intro2 = TextContent(\"A normal cleanup script would delete these. Warden refuses, and says why.\", \"small\")",
+            "intro2 = Callout(\"warning\", " + _q(f"A normal cleanup script would delete all {len(keep)}")
+            + ", \"Warden refuses each one and says why. Refusals are a feature, not a failure.\")",
             "ptable = Table([Col(\"Resource\", " + _arr(_q(f.get("name") or f.get("resource_id"), 40) for f in keep)
             + "), Col(\"Refused because\", "
             + _arr(_tag(_refusal_kind(f), "danger" if "suspicious" in " ".join(f.get("reasons") or []) else "warning")
@@ -166,12 +188,16 @@ def scan_ui(report: dict, mock: bool = False) -> str:
 
     # Tab 4: savings.
     priced = [f for f in act if f.get("est_monthly_usd")]
+    type_labels, type_values = _savings_by_type(priced)
     lines += [
-        "t4 = TabItem(\"savings\", \"Savings\", [sbar, spie])",
+        "t4 = TabItem(\"savings\", \"Savings\", [stitle, stype, sbar, spie])",
+        "stitle = TextContent(" + _q(f"{_money(summary.get('est_monthly_savings_usd'))} per month, by resource type")
+        + ", \"large-heavy\")",
+        "stype = SingleStackedBarChart(" + _arr(type_labels) + ", " + _arr(type_values) + ")",
         "sbar = HorizontalBarChart(" + _arr(_q(f.get("name") or f.get("resource_id"), 40) for f in priced)
         + ", [Series(\"$ per month\", " + _arr(_num(f.get("est_monthly_usd")) for f in priced) + ")], \"grouped\", \"$ per month\")",
         "spie = PieChart([\"Safe & reversible\", \"Needs your review\", \"Refused\"], ["
-        f"{tiers.get('safe_reversible', 0)}, {tiers.get('needs_review', 0)}, {tiers.get('protected', 0)}], \"donut\")",
+        f"{tiers.get('safe_reversible', 0)}, {tiers.get('needs_review', 0)}, {len(keep)}], \"donut\")",
     ]
 
     # Tab 5: how Warden decides.
@@ -198,7 +224,7 @@ def scan_ui(report: dict, mock: bool = False) -> str:
 
 def _refusal_kind(finding: dict) -> str:
     text = " ".join(finding.get("reasons") or []).lower()
-    for needle, label in (("suspicious", "Prompt-injection attempt"), ("production", "Production"),
+    for needle, label in (("human undid", "Undone by you"), ("suspicious", "Prompt-injection attempt"), ("production", "Production"),
                           ("legal", "Legal hold"), ("terraform", "Managed by code"), ("cloudformation", "Managed by code"),
                           ("used by ami", "Used by an image"), ("machine image", "Used by an image"), ("autoscaling", "Autoscaling"),
                           ("kubernetes", "Kubernetes"),
@@ -214,7 +240,7 @@ def watchdog_ui(result: dict) -> str:
     blocked = result.get("blocked") or {}
     checks = (result.get("checks") or [])[:10]
     lines = [
-        ("wd = Callout(\"success\", " + _q(f"Watchdog signed off {len(approved)} item(s)") + ", "
+        ("wd = Callout(\"success\", " + _q(f"🛡️ Watchdog signed off {len(approved)} item(s)") + ", "
          + _q(f"Action {result.get('action')} · single-use sign-off {result.get('signoff_id')} · expires {result.get('expires_at')}", 300) + ")")
         if approved else
         ("wd = Callout(\"error\", \"Watchdog blocked this request\", " + _q("Nothing will be executed.") + ")"),
@@ -229,14 +255,14 @@ def watchdog_ui(result: dict) -> str:
     return _program(children, lines)
 
 
-def receipt_ui(receipt: dict) -> str:
+def receipt_ui(receipt: dict, console_url: str | None = None) -> str:
     results = receipt.get("results") or []
     counts = receipt.get("counts") or {}
     ok = counts.get("done", 0) and not counts.get("failed", 0)
     status_tag = {"done": "success", "skipped": "warning", "failed": "danger"}
     lines = [
         ("rc = Callout(" + _q("success" if ok else "warning") + ", "
-         + _q(f"{receipt.get('action')}: {counts.get('done', 0)} done · {counts.get('skipped', 0)} skipped · "
+         + _q(f"{'✅' if ok else '⚠️'} {receipt.get('action')}: {counts.get('done', 0)} done · {counts.get('skipped', 0)} skipped · "
               f"{counts.get('failed', 0)} failed") + ", "
          + _q(f"Estimated saving {_money(receipt.get('est_monthly_savings_usd'))}/month · receipt {receipt.get('receipt_id')}", 240) + ")"),
     ]
@@ -250,10 +276,14 @@ def receipt_ui(receipt: dict) -> str:
                                                    for r in results)
                      + "), Col(\"Details\", " + _arr(_q(r.get("detail"), 70) for r in results)
                      + "), Col(\"\", " + _arr(undo_btns) + ", \"action\")])")
+    if console_url:
+        children.append("rcb")
+        lines.append("rcb = Buttons([" + _button("⏳ Rollback window", "Show the rollback window") + ", "
+                     + _open_button("Open full dashboard ↗", console_url) + "])")
     return _program(children, lines)
 
 
-def rollback_ui(window: dict) -> str:
+def rollback_ui(window: dict, console_url: str | None = None) -> str:
     items = window.get("items") or []
     ledger = window.get("ledger") or {}
     lines = [
@@ -276,4 +306,7 @@ def rollback_ui(window: dict) -> str:
     else:
         children.append("rwn")
         lines.append("rwn = TextContent(\"Nothing is waiting in a rollback window.\")")
+    if console_url:
+        children.append("rwb")
+        lines.append("rwb = Buttons([" + _open_button("Open full dashboard ↗ (live countdown)", console_url) + "])")
     return _program(children, lines)

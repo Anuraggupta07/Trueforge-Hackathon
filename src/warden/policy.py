@@ -15,8 +15,10 @@ INJECTION_REASON = (
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _ENV_KEYS = {"env", "environment", "stage"}
-# prod, prd, production, alone or followed by a separator (prod-eu, Production_US, prd.1).
-_PROD_VALUE = re.compile(r"^(?:prod|prd|production)(?:[-_ .:/].*)?$")
+# Any value starting with prod or prd (prod1, production2, prodeu, PRD-US; compared lower-cased). At least as
+# strict as the IAM deny on prod*/prd* in iam/warden-policy.json, so code and IAM refuse the same resources.
+# preprod, staging, nonprod stay unprotected.
+_PROD_VALUE = re.compile(r"^(?:prod|prd)")
 _LEGAL_HOLD_KEYS = {"legal-hold", "legal_hold", "legalhold"}
 _MANAGED_BY_KEYS = {"managedby", "managed-by", "managed_by"}
 _IAC_TOOLS = {"terraform", "cloudformation", "pulumi", "cdk", "crossplane"}

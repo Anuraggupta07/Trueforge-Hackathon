@@ -126,7 +126,7 @@ def run_checks(clients: AwsClients, settings: Settings) -> list[dict[str, str]]:
         extra_client(clients, "iam").get_account_summary()
         return _row("IAM read", OK, "get_account_summary readable")
 
-    rows.append(_safe("IAM read", "only informs: IAM deny policy setup and Deep Inspect v1.1", iam))
+    rows.append(_safe("IAM read", "only informs: IAM deny policy setup and Deep Inspect (roadmap)", iam))
     return rows
 
 

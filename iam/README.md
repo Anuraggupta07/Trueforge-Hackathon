@@ -62,3 +62,7 @@ Use the IAM policy simulator, or a dry run. For example, stopping a `env=prod` i
 ```bash
 aws ec2 stop-instances --instance-ids i-0123456789abcdef0 --dry-run
 ```
+
+## Two identities: the demo scripts are not Warden
+
+This policy is for the **Warden MCP server only**. The demo helpers `scripts/plant.py` and `scripts/reset.py` create and delete launch templates, AMIs, instances and Recycle Bin rules, which this policy deliberately does not allow (and `TerminateInstances` is explicitly denied). Run those scripts with a separate admin or sandbox identity, for example a different `AWS_PROFILE`, and run `warden-server` with the restricted one.

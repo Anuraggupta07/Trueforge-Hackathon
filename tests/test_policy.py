@@ -189,9 +189,24 @@ def test_prod_variants_protected(tags):
     assert policy.protection_reasons(tags), tags
 
 
-@pytest.mark.parametrize("tags", [{"env": "product-team"}, {"env": "preprod"}, {"env": "production2"}])
+@pytest.mark.parametrize(
+    "tags",
+    [{"env": "preprod"}, {"env": "pre-prod"}, {"env": "staging"}, {"Environment": "nonprod"}, {"stage": "dev"},
+     {"env": "reproduction"}],
+)
 def test_prod_lookalikes_not_protected(tags):
     assert policy.protection_reasons(tags) == []
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["prod1", "prod01", "Prod01", "production2", "prodeu", "PRD-US", "prd", "PROD", "prod-eu", "Production_US",
+     "product-team"],  # a plain prefix match, like the IAM deny on prod*/prd* (over-protecting is safe)
+)
+@pytest.mark.parametrize("key", ["env", "Environment", "stage"])
+def test_prod_prefix_values_protected_like_iam(key, value):  # review #6
+    assert policy.protection_reasons({key: value}) == [f"protected: {key.lower()}={value.lower()} (production)"]
+    assert policy.keep_reasons({key: value})
 
 
 def test_region_falls_back_to_the_aws_profile(monkeypatch, tmp_path):  # RA-9

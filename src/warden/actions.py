@@ -1,11 +1,13 @@
 """Mutating actions. Every public function returns a receipt; per-item failures never raise.
 
 Plan-gated flow: freeze check -> Watchdog sign-off (independent, single use) -> plan.validate_request ->
-for each approved id: re-describe -> scope + policy recheck -> fingerprint compare -> act -> verify -> result.
+for each approved id: freeze check -> re-describe -> scope + policy recheck -> fingerprint compare -> act
+(freeze re-checked right before each mutation) -> verify -> result.
 """
 
 from __future__ import annotations
 
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
@@ -19,6 +21,7 @@ from .aws import AwsClients, error_code, wait_for
 from .config import (
     TAG_BACKUP_OF,
     TAG_EXPIRES_AT,
+    TAG_HUMAN_UNDO_AT,
     TAG_PLAN_ID,
     TAG_QUARANTINED_AT,
     TAG_QUARANTINED_UNTIL,
@@ -58,9 +61,14 @@ BOOKKEEPING_TAGS = frozenset(
     {
         TAG_BACKUP_OF, TAG_EXPIRES_AT, TAG_PLAN_ID, TAG_RECYCLE, TAG_RECYCLED_AT, TAG_STOPPED_AT,
         TAG_RESTORE_AZ, TAG_RESTORE_TYPE, TAG_RESTORE_SIZE, TAG_RESTORE_IOPS, TAG_RESTORE_THROUGHPUT,
-        TAG_RESTORED_FROM, TAG_QUARANTINED_AT, TAG_QUARANTINED_UNTIL,
+        TAG_RESTORED_FROM, TAG_HUMAN_UNDO_AT, TAG_QUARANTINED_AT, TAG_QUARANTINED_UNTIL,
     }
 )
+# The human-owned protection tag. It sits inside warden:*, so the IAM policy explicitly denies Warden any write
+# or delete of it; Warden therefore never copies it (not even =false) onto a backup or a restored volume.
+PROTECT_TAG_KEY = "warden:protect"
+# One restore_volume at a time in this process: two quick Undo clicks must not both pass the duplicate check.
+_RESTORE_LOCK = threading.Lock()
 
 # (result, est_monthly_usd saved)
 Outcome = tuple[dict, float]
@@ -138,6 +146,37 @@ def _to_aws_tags(tags: dict[str, str]) -> list[dict[str, str]]:
     return [{"Key": k, "Value": v} for k, v in tags.items()]
 
 
+def _carried_tags(tags: dict[str, str]) -> dict[str, str]:
+    """A resource's own tags that Warden copies to a backup or restored volume: never aws:*, never Warden's
+    bookkeeping, never the protection tag (IAM denies writing it, in any letter case)."""
+    return {
+        k: v
+        for k, v in policy.copyable_tags(tags).items()
+        if k not in BOOKKEEPING_TAGS and str(k).strip().lower() != PROTECT_TAG_KEY
+    }
+
+
+def _frozen(settings: Settings, resource_id: str, **kw: Any) -> Outcome | None:
+    """A skip outcome if the freeze switch is on right now (checked right before each mutation), else None."""
+    return _skipped(resource_id, FROZEN_DETAIL, **kw) if is_frozen(settings) else None
+
+
+def _mark_human_undo(clients: AwsClients, resource_id: str) -> str:
+    """Tag a resource a human just brought back with TAG_HUMAN_UNDO_AT=now, so later scans do not propose it
+    again. Best effort: returns "" or a warning for the result detail, and never raises (the undo happened)."""
+    tags = [{"Key": TAG_HUMAN_UNDO_AT, "Value": audit_mod.iso_now()}]
+    for attempt in range(SETTLE_ATTEMPTS):
+        try:
+            clients.ec2.create_tags(Resources=[resource_id], Tags=tags)
+            return ""
+        except Exception as err:  # noqa: BLE001 - never fail an undo over a bookkeeping tag
+            if attempt == SETTLE_ATTEMPTS - 1 or not _is_not_found(err):
+                return (f"; WARNING could not tag {TAG_HUMAN_UNDO_AT} ({error_code(err)}) - a later scan may "
+                        "propose it again")
+            _sleep(SETTLE_DELAY_SECONDS)  # just restored: EC2 may not list it yet
+    return ""
+
+
 def _settle(check: Callable[[], bool], attempts: int = SETTLE_ATTEMPTS, delay: float = SETTLE_DELAY_SECONDS) -> bool:
     """True as soon as check() is true; re-reads a few times because EC2 is eventually consistent."""
     for attempt in range(attempts):
@@ -175,43 +214,59 @@ def _new_receipt(clients: AwsClients, settings: Settings, action: str, plan_id: 
     }
 
 
+def _save(settings: Settings, receipt: dict) -> None:
+    try:
+        audit_mod.save_receipt(settings, receipt)
+    except OSError as err:
+        receipt["save_error"] = f"receipt not persisted: {err}"
+
+
 def _finish(settings: Settings, receipt: dict, outcomes: list[Outcome]) -> dict:
-    """Fill counts/savings, persist the receipt and write audit lines."""
+    """Fill counts/savings, persist the receipt, then write audit lines.
+
+    AWS may already have changed, so the receipt (which the undo tools need) is saved first, and a ledger write
+    error is recorded on the receipt instead of raised: a mutation that happened always returns its receipt.
+    """
     results = [r for r, _ in outcomes]
     receipt["results"] = results
     receipt["counts"] = {s: sum(1 for r in results if r["status"] == s) for s in ("done", "skipped", "failed")}
     receipt["est_monthly_savings_usd"] = round(
         sum(saved for r, saved in outcomes if r["status"] == "done"), 2
     )
+    # A freeze switched on mid-batch is part of this receipt's story too.
+    receipt["freeze"] = bool(receipt.get("freeze")) or any(
+        str(r.get("detail") or "").startswith(FROZEN_DETAIL) for r in results
+    )
     receipt["finished_at"] = audit_mod.iso_now()
-    for r in results:
+    _save(settings, receipt)
+    try:
+        for r in results:
+            audit_mod.audit(
+                settings,
+                "action_item",
+                receipt_id=receipt["receipt_id"],
+                action=receipt["action"],
+                plan_id=receipt["plan_id"],
+                resource_id=r["resource_id"],
+                status=r["status"],
+                detail=r["detail"],
+                # Other ids this result is about (e.g. restore_volume: source and new volume), for resource_history.
+                **({"resource_ids": r["related_ids"]} if r.get("related_ids") else {}),
+            )
         audit_mod.audit(
             settings,
-            "action_item",
+            "action",
             receipt_id=receipt["receipt_id"],
             action=receipt["action"],
             plan_id=receipt["plan_id"],
-            resource_id=r["resource_id"],
-            status=r["status"],
-            detail=r["detail"],
-            # Other ids this result is about (e.g. restore_volume: source and new volume), for resource_history.
-            **({"resource_ids": r["related_ids"]} if r.get("related_ids") else {}),
+            account_id=receipt["account_id"],
+            region=receipt["region"],
+            counts=receipt["counts"],
+            est_monthly_savings_usd=receipt["est_monthly_savings_usd"],
         )
-    try:
-        audit_mod.save_receipt(settings, receipt)
     except OSError as err:
-        receipt["save_error"] = f"receipt not persisted: {err}"
-    audit_mod.audit(
-        settings,
-        "action",
-        receipt_id=receipt["receipt_id"],
-        action=receipt["action"],
-        plan_id=receipt["plan_id"],
-        account_id=receipt["account_id"],
-        region=receipt["region"],
-        counts=receipt["counts"],
-        est_monthly_savings_usd=receipt["est_monthly_savings_usd"],
-    )
+        receipt["ledger_error"] = f"audit ledger not written ({type(err).__name__}: {err}); the receipt is saved"
+        _save(settings, receipt)
     return receipt
 
 
@@ -355,6 +410,9 @@ def _run_gated(
         item = plan.items[rid]
 
         def step(item: plan_mod.PlanItem = item) -> Outcome:
+            frozen = _frozen(settings, item.resource_id)  # a FREEZE file created mid-batch stops the rest
+            if frozen:
+                return frozen
             signed = signed_fps.get(item.resource_id)
             if signed and signed != item.fingerprint:
                 return _skipped(item.resource_id, "Watchdog signed off a different state than the plan; re-verify")
@@ -372,11 +430,7 @@ def _run_gated(
 
 def _backup_tags(volume: dict, settings: Settings, plan_id: str, now: datetime) -> dict[str, str]:
     """Original (copyable, non-bookkeeping) tags + Warden restore metadata, within the 50-tag limit."""
-    original = {
-        k: v
-        for k, v in policy.copyable_tags(policy.tags_to_dict(volume.get("Tags"))).items()
-        if k not in BOOKKEEPING_TAGS
-    }
+    original = _carried_tags(policy.tags_to_dict(volume.get("Tags")))
     warden = {
         TAG_BACKUP_OF: volume["VolumeId"],
         TAG_EXPIRES_AT: _utc_iso(now + timedelta(days=settings.backup_retention_days)),
@@ -405,16 +459,27 @@ def _volume_cost(volume: dict, settings: Settings) -> float:
 
 
 def _existing_backup(clients: AwsClients, vol_id: str, plan_id: str) -> dict | None:
-    """A backup of this volume from an earlier call for the same plan (e.g. one that ran out of time)."""
+    """A backup of this volume from an earlier call for the same plan (e.g. one that ran out of time).
+
+    Only a snapshot taken OF this volume (VolumeId) and tagged as its backup is reused: tags are writable by
+    anyone, so a snapshot of another volume carrying the right tags must never stand in for this volume's data.
+    The filters narrow the listing; the checks below decide.
+    """
     snaps = clients.ec2.describe_snapshots(
         OwnerIds=["self"],
         Filters=[
+            {"Name": "volume-id", "Values": [vol_id]},
             {"Name": f"tag:{TAG_BACKUP_OF}", "Values": [vol_id]},
             {"Name": f"tag:{TAG_PLAN_ID}", "Values": [plan_id]},
             {"Name": "status", "Values": ["pending", "completed"]},
         ],
     ).get("Snapshots") or []
-    return snaps[0] if snaps else None
+    for snap in snaps:
+        tags = policy.tags_to_dict(snap.get("Tags"))
+        if (snap.get("VolumeId") == vol_id and tags.get(TAG_BACKUP_OF) == vol_id and tags.get(TAG_PLAN_ID) == plan_id
+                and snap.get("State") in ("pending", "completed")):
+            return snap
+    return None
 
 
 def _quarantine_one(
@@ -459,6 +524,12 @@ def _quarantine_one(
         return _skipped(vol_id, "no longer exists (disappeared during backup)", backup_snapshot_id=snap_id)
     if latest.get("State") != "available" or latest.get("Attachments"):
         return _skipped(vol_id, "volume was attached during backup; volume kept", backup_snapshot_id=snap_id)
+    if is_frozen(settings):  # the backup wait can be long; the operator may have frozen Warden meanwhile
+        return _skipped(
+            vol_id, f"{FROZEN_DETAIL}; volume kept (its backup {snap_id} is complete; a later quarantine_volumes "
+            "call for this plan reuses it)",
+            backup_snapshot_id=snap_id,
+        )
     undo = {"tool": "restore_volume", "args": {"backup_snapshot_id": snap_id}}
     try:
         ec2.delete_volume(VolumeId=vol_id)
@@ -549,6 +620,9 @@ def _recycle_one(clients: AwsClients, settings: Settings, plan_id: str, snap_id:
             snap_id, f"{TAG_RECYCLE} tag not visible yet, so the Recycle Bin rule might not keep it; "
             "snapshot kept (not deleted) - try again"
         )
+    if is_frozen(settings):
+        _untag_recycle(ec2, snap_id)
+        return _skipped(snap_id, FROZEN_DETAIL)
     try:
         ec2.delete_snapshot(SnapshotId=snap_id)
     except ClientError as err:
@@ -616,6 +690,9 @@ def _delete_snapshot_one(clients: AwsClients, settings: Settings, plan_id: str, 
         return _skipped(snap_id, f"could not check which AMIs use it ({error_code(err)}); snapshot kept")
     if amis:
         return _skipped(snap_id, f"changed since approval: used by AMI {', '.join(amis)}; snapshot kept")
+    frozen = _frozen(settings, snap_id)
+    if frozen:
+        return frozen
     try:
         clients.ec2.delete_snapshot(SnapshotId=snap_id)
     except ClientError as err:
@@ -676,6 +753,9 @@ def _stop_one(clients: AwsClients, settings: Settings, plan_id: str, inst_id: st
     busy = _became_active(clients, settings, inst)
     if busy:
         return _skipped(inst_id, busy)
+    frozen = _frozen(settings, inst_id)  # the activity re-check reads CloudWatch, which takes a moment
+    if frozen:
+        return frozen
     ec2 = clients.ec2
     resp = ec2.stop_instances(InstanceIds=[inst_id])
     state = _state_from(resp, "StoppingInstances", inst_id)
@@ -781,6 +861,9 @@ def _release_one(clients: AwsClients, settings: Settings, plan_id: str, alloc_id
         return _skipped(
             alloc_id, f"changed since approval: DNS record {'; '.join(refs)} points at {ip}; not released", public_ip=ip
         )
+    frozen = _frozen(settings, alloc_id, public_ip=ip)
+    if frozen:
+        return frozen
     try:
         clients.ec2.release_address(AllocationId=alloc_id)
     except ClientError as err:
@@ -831,7 +914,48 @@ def _run_simple(
     clean, problem = _check_ids(ids, limit)
     if problem:
         return _finish(settings, receipt, [_skipped(rid, problem) for rid in clean])
-    return _finish(settings, receipt, [_safe(lambda rid=rid: actor(rid), rid) for rid in clean])
+    # The freeze is re-checked per item: a FREEZE file created mid-batch stops the remaining items.
+    outcomes = [_frozen(settings, rid) or _safe(lambda rid=rid: actor(rid), rid) for rid in clean]
+    return _finish(settings, receipt, outcomes)
+
+
+def _live_volume(vol: dict | None) -> bool:
+    return vol is not None and vol.get("State") not in ("deleting", "deleted")
+
+
+def _already_restored(clients: AwsClients, settings: Settings, snap_id: str) -> str | None:
+    """Id of a volume already restored from this backup that still exists, else None.
+
+    Restoring again while one exists (a retry after a timeout, an old receipt's Undo button) would only create a
+    duplicate, billable volume. Checks volumes tagged warden:restored-from=<snap_id>, then the volumes Warden's own
+    restore_volume receipts recorded: EC2's tag listing can lag a new volume, so a recorded volume is re-read a
+    few times before it is believed gone.
+    """
+    try:
+        tagged = clients.ec2.describe_volumes(
+            Filters=[{"Name": f"tag:{TAG_RESTORED_FROM}", "Values": [snap_id]}]
+        ).get("Volumes") or []
+    except ClientError as err:
+        if not _is_not_found(err):
+            raise
+        tagged = []
+    for vol in tagged:
+        if _live_volume(vol):
+            return str(vol.get("VolumeId"))
+    listed = {vol.get("VolumeId") for vol in tagged}
+    for _, r in _warden_results(settings, "restore_volume", snap_id):
+        vid = r.get("restored_volume_id")
+        if r.get("status") != "done" or not vid or vid in listed:
+            continue
+        seen: dict[str, dict | None] = {}
+
+        def visible(vid: str = str(vid)) -> bool:
+            seen["vol"] = _describe_volume(clients, vid)
+            return seen["vol"] is not None
+
+        if _settle(visible) and _live_volume(seen.get("vol")):
+            return str(vid)
+    return None
 
 
 def _restore_volume_one(clients: AwsClients, settings: Settings, snap_id: str) -> Outcome:
@@ -849,6 +973,18 @@ def _restore_volume_one(clients: AwsClients, settings: Settings, snap_id: str) -
     az = tags.get(TAG_RESTORE_AZ)
     if not az:
         return _failed(snap_id, f"backup is missing {TAG_RESTORE_AZ}; cannot pick an Availability Zone")
+    existing = _already_restored(clients, settings, snap_id)
+    if existing:
+        result = _result(
+            snap_id, "skipped",
+            f"already restored as {existing}; nothing to undo (restoring again would create a duplicate volume)",
+            backup_snapshot_id=snap_id,
+        )
+        result["restored_volume_id"] = existing
+        return result, 0.0
+    frozen = _frozen(settings, snap_id)
+    if frozen:
+        return frozen
     vtype = tags.get(TAG_RESTORE_TYPE) or "gp3"
     kwargs: dict[str, Any] = {"AvailabilityZone": az, "SnapshotId": snap_id, "VolumeType": vtype}
     size = tags.get(TAG_RESTORE_SIZE, "")
@@ -860,9 +996,10 @@ def _restore_volume_one(clients: AwsClients, settings: Settings, snap_id: str) -
     throughput = tags.get(TAG_RESTORE_THROUGHPUT, "")
     if throughput.isdigit() and vtype == "gp3":
         kwargs["Throughput"] = int(throughput)
-    original = {k: v for k, v in policy.copyable_tags(tags).items() if k not in BOOKKEEPING_TAGS}
-    original[TAG_RESTORED_FROM] = snap_id
-    kwargs["TagSpecifications"] = [{"ResourceType": "volume", "Tags": _to_aws_tags(original)}]
+    warden = {TAG_RESTORED_FROM: snap_id, TAG_HUMAN_UNDO_AT: audit_mod.iso_now()}
+    original = dict(list(_carried_tags(tags).items())[: MAX_TAGS_PER_RESOURCE - len(warden)])
+    # The human-undo mark is written with the volume itself (tag-on-create), so no scan can see it unmarked.
+    kwargs["TagSpecifications"] = [{"ResourceType": "volume", "Tags": _to_aws_tags({**original, **warden})}]
     created = clients.ec2.create_volume(**kwargs)  # its response is authoritative; describe may lag
     new_vol = created["VolumeId"]
     detail = f"restored {source} as {new_vol} in {az} ({vtype}, state {created.get('State')}); attach it where needed"
@@ -872,11 +1009,15 @@ def _restore_volume_one(clients: AwsClients, settings: Settings, snap_id: str) -
 
 
 def restore_volume(clients: AwsClients, settings: Settings, backup_snapshot_id: str) -> dict:
-    """Recreate a quarantined volume from its Warden backup snapshot (original AZ, type, tags)."""
-    return _run_simple(
-        clients, settings, "restore_volume", [backup_snapshot_id], 1,
-        lambda sid: _restore_volume_one(clients, settings, sid),
-    )
+    """Recreate a quarantined volume from its Warden backup snapshot (original AZ, type, tags).
+
+    Idempotent: if a volume restored from this backup still exists, nothing is created.
+    """
+    with _RESTORE_LOCK:  # held until the receipt is saved, so a second call sees the first one's receipt
+        return _run_simple(
+            clients, settings, "restore_volume", [backup_snapshot_id], 1,
+            lambda sid: _restore_volume_one(clients, settings, sid),
+        )
 
 
 def _recycled_by_warden(settings: Settings, snapshot_id: str) -> bool:
@@ -903,6 +1044,7 @@ def _restore_snapshot_one(clients: AwsClients, settings: Settings, snap_id: str)
         clients.ec2.delete_tags(Resources=[snap_id], Tags=[{"Key": TAG_RECYCLE}, {"Key": TAG_RECYCLED_AT}])
     except ClientError as err:
         detail += f"; WARNING could not remove {TAG_RECYCLE} tag ({error_code(err)})"
+    detail += _mark_human_undo(clients, snap_id)
     if _describe_snapshot(clients, snap_id) is None:
         detail += "; snapshot not yet visible in describe_snapshots (restores can take a moment)"
     return _result(snap_id, "done", detail), 0.0
@@ -945,6 +1087,7 @@ def _start_one(clients: AwsClients, settings: Settings, inst_id: str) -> Outcome
         clients.ec2.delete_tags(Resources=[inst_id], Tags=[{"Key": TAG_STOPPED_AT}])
     except ClientError as err:
         detail += f"; WARNING could not remove {TAG_STOPPED_AT} ({error_code(err)})"
+    detail += _mark_human_undo(clients, inst_id)
     return _result(inst_id, "done", detail), 0.0
 
 
@@ -971,7 +1114,8 @@ def _cancel_quarantine_one(clients: AwsClients, settings: Settings, alloc_id: st
     clients.ec2.delete_tags(
         Resources=[alloc_id], Tags=[{"Key": TAG_QUARANTINED_AT}, {"Key": TAG_QUARANTINED_UNTIL}, {"Key": TAG_PLAN_ID}]
     )
-    return _result(alloc_id, "done", f"quarantine cancelled; {ip} kept and will not be released", public_ip=ip), 0.0
+    detail = f"quarantine cancelled; {ip} kept and will not be released" + _mark_human_undo(clients, alloc_id)
+    return _result(alloc_id, "done", detail, public_ip=ip), 0.0
 
 
 def cancel_address_quarantine(clients: AwsClients, settings: Settings, allocation_id: str) -> dict:

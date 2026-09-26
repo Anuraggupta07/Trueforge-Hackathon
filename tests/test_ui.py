@@ -88,3 +88,32 @@ def test_other_dashboards_are_valid():
                                   "items": [{"resource_id": "vol-1", "state": "backup", "countdown": "6d 23h",
                                              "flags": [], "undo": {"tool": "restore_volume", "args": {}}}]}))
     check_program(ui.rollback_ui({"ledger": {"ok": False, "reason": "tampered"}, "items": []}))
+
+
+def test_wardens_own_backups_are_not_counted_as_refusals():
+    report = dict(REPORT)
+    backup = finding("snap-bk", "snapshot", "keep", tier="protected", name="warden-demo-old-data",
+                     reasons=["Warden backup of vol-1, restorable until 2026-10-03T00:00:00Z"])
+    report["findings"] = REPORT["findings"] + [backup]
+    program = ui.scan_ui(report)
+    check_program(program)
+    assert "snap-bk" not in program            # not listed as a refusal
+    assert 'Refused (2)' in program            # the two real refusals only
+    assert '"🛡️ Refused", "small"), TextContent("2"' in program
+
+
+def test_human_undo_refusal_is_labelled():
+    assert ui._refusal_kind({"reasons": ["a human undid Warden's action here (2026-09-26); Warden will not propose it again"]}) == "Undone by you"
+
+
+def test_console_links_are_valid_openui():
+    url = "http://127.0.0.1:8000/console"
+    program = ui.scan_ui(REPORT, mock=True, console_url=url)
+    check_program(program)
+    assert '@OpenUrl("http://127.0.0.1:8000/console")' in program
+    assert "SingleStackedBarChart(" in program and "You stay in control" in program
+    receipt = {"action": "quarantine_volume", "counts": {"done": 1}, "receipt_id": "r1",
+               "results": [{"resource_id": "vol-1", "status": "done", "detail": "ok", "undo": None}]}
+    check_program(ui.receipt_ui(receipt, console_url=url))
+    check_program(ui.rollback_ui({"ledger": {"ok": True, "entries": 1}, "items": []}, console_url=url))
+    assert "@OpenUrl" not in ui.scan_ui(REPORT)  # no console link unless the server passes one

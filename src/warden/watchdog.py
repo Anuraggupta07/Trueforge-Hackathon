@@ -202,6 +202,31 @@ def _ami_users(clients: AwsClients, snapshot_id: str, cache: dict) -> list[str]:
     ]
 
 
+def _template_users(clients: AwsClients, snapshot_id: str, cache: dict) -> list[str]:
+    """Launch templates whose $Default/$Latest version creates a disk from this snapshot, as 'name (id)'
+    (raises if templates or their versions cannot be read). Built once per verify call."""
+    if "template_snapshots" not in cache:
+        ec2 = clients.ec2
+        templates: list[dict] = []
+        if ec2.can_paginate("describe_launch_templates"):
+            for page in ec2.get_paginator("describe_launch_templates").paginate():
+                templates.extend(page.get("LaunchTemplates") or [])
+        else:
+            templates = list(ec2.describe_launch_templates().get("LaunchTemplates") or [])
+        index: dict[str, list[str]] = {}
+        for tpl in templates:
+            tid = tpl.get("LaunchTemplateId")
+            label = f"{tpl.get('LaunchTemplateName')} ({tid})"
+            resp = ec2.describe_launch_template_versions(LaunchTemplateId=tid, Versions=["$Default", "$Latest"])
+            for ver in resp.get("LaunchTemplateVersions") or []:
+                for bdm in (ver.get("LaunchTemplateData") or {}).get("BlockDeviceMappings") or []:
+                    snap = (bdm.get("Ebs") or {}).get("SnapshotId")
+                    if snap and label not in index.setdefault(snap, []):
+                        index[snap].append(label)
+        cache["template_snapshots"] = index
+    return list(cache["template_snapshots"].get(snapshot_id, []))
+
+
 def _dns_refs(clients: AwsClients, ip: str | None, cache: dict) -> list[str]:
     if not ip:
         return []
@@ -236,7 +261,13 @@ def _action_check(
             return f"could not check which AMIs use it ({error_code(err)})", []
         if amis:
             return f"used by AMI {', '.join(amis)} - launches from it would break", []
-        return None, [f"{rid}: completed and not used by any self-owned AMI"]
+        try:
+            templates = _template_users(clients, rid, cache)
+        except Exception as err:  # noqa: BLE001 - fail closed
+            return f"could not check which launch templates use it ({error_code(err)})", []
+        if templates:
+            return f"used by launch template {', '.join(templates)} - launches would fail", []
+        return None, [f"{rid}: completed and not used by any self-owned AMI or launch template"]
 
     if action == "stop_instance":
         state = (res.get("State") or {}).get("Name")

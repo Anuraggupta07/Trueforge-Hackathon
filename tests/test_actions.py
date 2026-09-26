@@ -17,6 +17,7 @@ from warden import plan as plan_mod
 from warden.config import (
     TAG_BACKUP_OF,
     TAG_EXPIRES_AT,
+    TAG_HUMAN_UNDO_AT,
     TAG_PLAN_ID,
     TAG_QUARANTINED_AT,
     TAG_QUARANTINED_UNTIL,
@@ -539,6 +540,8 @@ def test_restore_volume_recreates_with_original_tags_in_az(aws, settings):
     new = restored[0]
     assert new["AvailabilityZone"] == AZ and new["VolumeType"] == "gp3" and new["Size"] == 12
     tags = tags_to_dict(new["Tags"])
+    undo_at = tags.pop(TAG_HUMAN_UNDO_AT)  # a human undid this: later scans leave it alone
+    assert actions._parse_utc(undo_at) is not None
     assert tags == {"Name": "db-scratch", "team": "data", "warden:demo": "true", TAG_RESTORED_FROM: snap_id}
     assert new["VolumeId"] in receipt["results"][0]["detail"]
 
@@ -1080,7 +1083,9 @@ def test_cancel_address_quarantine_removes_tags(aws, settings):
 
     assert statuses(receipt) == ["done"], receipt
     assert receipt["plan_id"] is None and receipt["action"] == "cancel_address_quarantine"
-    assert _addr_tags(aws, aid) == {"Name": "keep-me"}
+    tags = _addr_tags(aws, aid)
+    assert actions._parse_utc(tags.pop(TAG_HUMAN_UNDO_AT)) is not None  # a human kept it: later scans leave it alone
+    assert tags == {"Name": "keep-me"}
 
 
 def test_cancel_address_quarantine_refuses_untagged(aws, settings):
@@ -1230,3 +1235,311 @@ def test_restore_volume_is_in_the_source_volume_history(aws, settings):  # demo 
     latest = audit.history(settings, vid)[0]
     assert latest["event"] == "action_item" and latest["action"] == "restore_volume"
     assert res["restored_volume_id"] in latest["resource_ids"]
+
+
+# ---------------------------------------------------------------- confirmed review findings (trust layer)
+
+
+def _quarantined_backup(aws, settings, tags: dict[str, str] | None = None) -> tuple[str, str]:
+    """(volume id, backup snapshot id) of a volume Warden quarantined for real."""
+    vol = make_volume(aws, tags or {"Name": "db-scratch"})
+    vid = vol["VolumeId"]
+    pid = make_plan(aws, settings, [("volume", "quarantine_volume", vol)])
+    res = actions.quarantine_volumes(aws, settings, pid, [vid], signoff=SIG)["results"][0]
+    assert res["status"] == "done", res
+    return vid, res["backup_snapshot_id"]
+
+
+def _restored_from(aws, snap_id: str) -> list[dict]:
+    vols = aws.ec2.describe_volumes(Filters=[{"Name": f"tag:{TAG_RESTORED_FROM}", "Values": [snap_id]}])["Volumes"]
+    return [v for v in vols if v["State"] not in ("deleting", "deleted")]
+
+
+def test_restore_volume_twice_does_not_duplicate(aws, settings, monkeypatch):  # finding 20 / 5
+    _, snap_id = _quarantined_backup(aws, settings)
+    first = actions.restore_volume(aws, settings, snap_id)
+    assert statuses(first) == ["done"], first
+    new_vol = first["results"][0]["restored_volume_id"]
+    creates: list[dict] = []
+    real_create = aws.ec2.create_volume
+    monkeypatch.setattr(aws.ec2, "create_volume", lambda **kw: creates.append(kw) or real_create(**kw))
+
+    again = actions.restore_volume(aws, settings, snap_id)  # a retry, or an old receipt's Undo button
+
+    assert statuses(again) == ["skipped"], again
+    assert f"already restored as {new_vol}" in again["results"][0]["detail"]
+    assert creates == []
+    assert [v["VolumeId"] for v in _restored_from(aws, snap_id)] == [new_vol]
+
+
+def test_restore_volume_retry_uses_receipt_when_ec2_listing_lags(aws, settings, monkeypatch):  # finding 20
+    _, snap_id = _quarantined_backup(aws, settings)
+    new_vol = actions.restore_volume(aws, settings, snap_id)["results"][0]["restored_volume_id"]
+    real_describe = aws.ec2.describe_volumes
+    reads = {"by_id": 0}
+
+    def lagging(**kw):  # the tag filter does not show the new volume yet; describe-by-id catches up on a re-read
+        if kw.get("Filters"):
+            return {"Volumes": []}
+        reads["by_id"] += 1
+        if reads["by_id"] == 1:
+            raise _client_error("InvalidVolume.NotFound", "DescribeVolumes")
+        return real_describe(**kw)
+
+    monkeypatch.setattr(aws.ec2, "describe_volumes", lagging)
+    again = actions.restore_volume(aws, settings, snap_id)
+    assert statuses(again) == ["skipped"], again
+    assert f"already restored as {new_vol}" in again["results"][0]["detail"]
+    monkeypatch.setattr(aws.ec2, "describe_volumes", real_describe)
+    assert len(_restored_from(aws, snap_id)) == 1
+
+
+def test_restore_volume_allowed_again_after_restored_volume_deleted(aws, settings):  # finding 20: only live copies block
+    _, snap_id = _quarantined_backup(aws, settings)
+    first = actions.restore_volume(aws, settings, snap_id)["results"][0]["restored_volume_id"]
+    aws.ec2.delete_volume(VolumeId=first)
+    again = actions.restore_volume(aws, settings, snap_id)
+    assert statuses(again) == ["done"], again
+    assert again["results"][0]["restored_volume_id"] != first
+
+
+def test_existing_backup_of_another_volume_is_never_reused(aws, settings):  # finding 1
+    victim = make_volume(aws, {"Name": "victim"})
+    vid = victim["VolumeId"]
+    pid = make_plan(aws, settings, [("volume", "quarantine_volume", victim)])
+    decoy_vol = make_volume(aws, {"Name": "decoy"})
+    decoy = aws.ec2.create_snapshot(
+        VolumeId=decoy_vol["VolumeId"],
+        TagSpecifications=_tagspec("snapshot", {TAG_BACKUP_OF: vid, TAG_PLAN_ID: pid}),
+    )["SnapshotId"]
+
+    receipt = actions.quarantine_volumes(aws, settings, pid, [vid], signoff=SIG)
+
+    assert statuses(receipt) == ["done"], receipt
+    backup = receipt["results"][0]["backup_snapshot_id"]
+    assert backup != decoy
+    assert aws.ec2.describe_snapshots(SnapshotIds=[backup])["Snapshots"][0]["VolumeId"] == vid
+
+
+def test_existing_backup_requires_matching_backup_of_tag(aws, settings, monkeypatch):  # finding 1
+    vol = make_volume(aws)
+    vid = vol["VolumeId"]
+    wrong_tag = {"SnapshotId": "snap-0wrongtag", "VolumeId": vid, "State": "completed",
+                 "Tags": [{"Key": TAG_BACKUP_OF, "Value": "vol-0someoneelse"}, {"Key": TAG_PLAN_ID, "Value": "plan-x"}]}
+    other_vol = {"SnapshotId": "snap-0othervol", "VolumeId": "vol-0other", "State": "completed",
+                 "Tags": [{"Key": TAG_BACKUP_OF, "Value": vid}, {"Key": TAG_PLAN_ID, "Value": "plan-x"}]}
+    good = {"SnapshotId": "snap-0good", "VolumeId": vid, "State": "pending",
+            "Tags": [{"Key": TAG_BACKUP_OF, "Value": vid}, {"Key": TAG_PLAN_ID, "Value": "plan-x"}]}
+    # Even if EC2 ignored the filters, only a snapshot OF this volume, tagged as its backup, is reused.
+    monkeypatch.setattr(aws.ec2, "describe_snapshots", lambda **kw: {"Snapshots": [wrong_tag, other_vol]})
+    assert actions._existing_backup(aws, vid, "plan-x") is None
+    monkeypatch.setattr(aws.ec2, "describe_snapshots", lambda **kw: {"Snapshots": [wrong_tag, other_vol, good]})
+    assert actions._existing_backup(aws, vid, "plan-x")["SnapshotId"] == "snap-0good"
+
+
+def _freeze(settings) -> None:
+    settings.state_dir.mkdir(parents=True, exist_ok=True)
+    (settings.state_dir / "FREEZE").write_text("", encoding="utf-8")
+
+
+def test_freeze_mid_batch_stops_remaining_items(aws, settings, monkeypatch):  # finding 2
+    vols = [make_volume(aws) for _ in range(3)]
+    ids = [v["VolumeId"] for v in vols]
+    pid = make_plan(aws, settings, [("volume", "quarantine_volume", v) for v in vols])
+    real_delete = aws.ec2.delete_volume
+
+    def delete_then_operator_freezes(**kw):
+        out = real_delete(**kw)
+        _freeze(settings)  # the operator sees the first delete and pulls the switch
+        return out
+
+    monkeypatch.setattr(aws.ec2, "delete_volume", delete_then_operator_freezes)
+    receipt = actions.quarantine_volumes(aws, settings, pid, ids, signoff=SIG)
+
+    assert statuses(receipt) == ["done", "skipped", "skipped"], receipt
+    assert [r["detail"] for r in receipt["results"][1:]] == [actions.FROZEN_DETAIL] * 2
+    assert receipt["freeze"] is True
+    for vid in ids[1:]:
+        assert aws.ec2.describe_volumes(VolumeIds=[vid])["Volumes"][0]["State"] == "available"
+        assert aws.ec2.describe_snapshots(Filters=[{"Name": f"tag:{TAG_BACKUP_OF}", "Values": [vid]}])["Snapshots"] == []
+
+
+def test_freeze_during_backup_wait_keeps_the_volume(aws, settings, monkeypatch):  # finding 2
+    vol = make_volume(aws)
+    vid = vol["VolumeId"]
+    pid = make_plan(aws, settings, [("volume", "quarantine_volume", vol)])
+
+    class FreezeWhileWaiting:
+        def wait(self, **_):
+            _freeze(settings)
+
+    monkeypatch.setattr(aws.ec2, "get_waiter", lambda name: FreezeWhileWaiting())
+    receipt = actions.quarantine_volumes(aws, settings, pid, [vid], signoff=SIG)
+
+    res = receipt["results"][0]
+    assert res["status"] == "skipped", receipt
+    assert res["detail"].startswith(actions.FROZEN_DETAIL) and res["backup_snapshot_id"]
+    assert aws.ec2.describe_volumes(VolumeIds=[vid])["Volumes"][0]["State"] == "available"
+
+
+def test_freeze_mid_batch_stops_start_instances(aws, settings, monkeypatch):  # finding 2 (undo tools too)
+    insts = [make_instance(aws), make_instance(aws)]
+    ids = [i["InstanceId"] for i in insts]
+    pid = make_plan(aws, settings, [("instance", "stop_instance", i) for i in insts])
+    assert statuses(actions.stop_instances(aws, settings, pid, ids, signoff=SIG)) == ["done", "done"]
+    real_start = aws.ec2.start_instances
+
+    def start_then_freeze(**kw):
+        out = real_start(**kw)
+        _freeze(settings)
+        return out
+
+    monkeypatch.setattr(aws.ec2, "start_instances", start_then_freeze)
+    receipt = actions.start_instances(aws, settings, ids)
+    assert statuses(receipt) == ["done", "skipped"], receipt
+    assert receipt["results"][1]["detail"] == actions.FROZEN_DETAIL
+    desc = aws.ec2.describe_instances(InstanceIds=[ids[1]])["Reservations"][0]["Instances"][0]
+    assert desc["State"]["Name"] == "stopped"
+
+
+def test_freeze_right_before_stop_after_activity_recheck(aws, settings, monkeypatch):  # finding 2
+    inst = make_instance(aws)
+    iid = inst["InstanceId"]
+    pid = make_plan(aws, settings, [("instance", "stop_instance", inst)])
+
+    def slow_recheck(clients, s, i):
+        _freeze(settings)  # frozen while CloudWatch was being read
+        return None
+
+    monkeypatch.setattr(actions, "_became_active", slow_recheck)
+    receipt = actions.stop_instances(aws, settings, pid, [iid], signoff=SIG)
+    assert statuses(receipt) == ["skipped"]
+    assert receipt["results"][0]["detail"] == actions.FROZEN_DETAIL
+    desc = aws.ec2.describe_instances(InstanceIds=[iid])["Reservations"][0]["Instances"][0]
+    assert desc["State"]["Name"] == "running"
+
+
+def _tag_writes(aws, monkeypatch) -> list[tuple[str, list[str], dict[str, str]]]:
+    """Spy on every call that writes or deletes tags (explicitly or on create): (call, resources, tags)."""
+    seen: list[tuple[str, list[str], dict[str, str]]] = []
+    for name in ("create_tags", "delete_tags", "create_snapshot", "create_volume"):
+        real = getattr(aws.ec2, name)
+
+        def spy(real=real, name=name, **kw):
+            tags = {t["Key"]: t.get("Value", "") for t in kw.get("Tags") or []}
+            for spec in kw.get("TagSpecifications") or []:
+                tags.update({t["Key"]: t.get("Value", "") for t in spec.get("Tags") or []})
+            seen.append((name, list(kw.get("Resources") or []), tags))
+            return real(**kw)
+
+        monkeypatch.setattr(aws.ec2, name, spy)
+    return seen
+
+
+def test_undo_tools_mark_human_undo(aws, settings, recycle_bin, monkeypatch):  # finding 7 / 25 (actions side)
+    # restore_volume: the NEW volume carries the mark from the moment it exists.
+    _, backup = _quarantined_backup(aws, settings)
+    restored = actions.restore_volume(aws, settings, backup)["results"][0]
+    assert restored["status"] == "done", restored
+    new_tags = tags_to_dict(aws.ec2.describe_volumes(VolumeIds=[restored["restored_volume_id"]])["Volumes"][0]["Tags"])
+    assert actions._parse_utc(new_tags.get(TAG_HUMAN_UNDO_AT)) is not None, new_tags
+
+    # start_instances: the instance.
+    inst = make_instance(aws)
+    iid = inst["InstanceId"]
+    pid = make_plan(aws, settings, [("instance", "stop_instance", inst)])
+    assert statuses(actions.stop_instances(aws, settings, pid, [iid], signoff=SIG)) == ["done"]
+    assert statuses(actions.start_instances(aws, settings, [iid])) == ["done"]
+    desc = aws.ec2.describe_instances(InstanceIds=[iid])["Reservations"][0]["Instances"][0]
+    assert actions._parse_utc(tags_to_dict(desc["Tags"]).get(TAG_HUMAN_UNDO_AT)) is not None
+
+    # cancel_address_quarantine: the address.
+    addr = make_address(aws)
+    aid = addr["AllocationId"]
+    pid = make_plan(aws, settings, [("address", "quarantine_address", addr)])
+    assert statuses(actions.quarantine_addresses(aws, settings, pid, [aid], signoff=SIG)) == ["done"]
+    assert statuses(actions.cancel_address_quarantine(aws, settings, aid)) == ["done"]
+    assert actions._parse_utc(_addr_tags(aws, aid).get(TAG_HUMAN_UNDO_AT)) is not None
+
+    # restore_snapshot: the snapshot (moto really deleted it, so record the tag call Warden makes).
+    snap = make_snapshot(aws)
+    sid = snap["SnapshotId"]
+    pid = make_plan(aws, settings, [("snapshot", "recycle_snapshot", snap)])
+    assert statuses(actions.recycle_snapshots(aws, settings, pid, [sid], signoff=SIG)) == ["done"]
+    tagged: list[dict] = []
+    monkeypatch.setattr(aws.ec2, "create_tags", lambda **kw: tagged.append(kw) or {})
+    receipt = actions.restore_snapshot(aws, settings, sid)
+    assert statuses(receipt) == ["done"], receipt
+    marks = [t["Value"] for kw in tagged if kw["Resources"] == [sid] for t in kw["Tags"] if t["Key"] == TAG_HUMAN_UNDO_AT]
+    assert len(marks) == 1 and actions._parse_utc(marks[0]) is not None
+
+
+def test_human_undo_mark_failure_never_fails_the_undo(aws, settings, monkeypatch):  # finding 7 / 25
+    addr = make_address(aws)
+    aid = addr["AllocationId"]
+    pid = make_plan(aws, settings, [("address", "quarantine_address", addr)])
+    assert statuses(actions.quarantine_addresses(aws, settings, pid, [aid], signoff=SIG)) == ["done"]
+
+    def denied(**kw):
+        raise _client_error("UnauthorizedOperation", "CreateTags")
+
+    monkeypatch.setattr(aws.ec2, "create_tags", denied)
+    receipt = actions.cancel_address_quarantine(aws, settings, aid)
+    res = receipt["results"][0]
+    assert res["status"] == "done", receipt
+    assert "WARNING" in res["detail"] and TAG_HUMAN_UNDO_AT in res["detail"]
+    assert TAG_QUARANTINED_UNTIL not in _addr_tags(aws, aid)  # the undo itself happened
+
+
+def test_warden_never_writes_or_deletes_the_protect_tag(aws, settings, recycle_bin, monkeypatch):  # finding 14
+    # warden:protect=false is not a protection, so these may be acted on; the key must never be written or deleted.
+    unprotected = {"warden:protect": "false"}
+    vol = make_volume(aws, {"Name": "scratch", "warden:protect": "false", "Warden:Protect": "no"})
+    inst = make_instance(aws, unprotected)
+    addr = make_address(aws, unprotected)
+    snap = make_snapshot(aws, unprotected)
+    # An older backup that still carries the key must not plant it on the restored volume either.
+    _, old_backup = _quarantined_backup(aws, settings)
+    aws.ec2.create_tags(Resources=[old_backup], Tags=[{"Key": "WARDEN:PROTECT", "Value": "false"}])
+    writes = _tag_writes(aws, monkeypatch)  # from here on, only Warden writes tags
+
+    vid = vol["VolumeId"]
+    pid = make_plan(aws, settings, [("volume", "quarantine_volume", vol)])
+    res = actions.quarantine_volumes(aws, settings, pid, [vid], signoff=SIG)["results"][0]
+    assert res["status"] == "done", res
+    backup_tags = tags_to_dict(aws.ec2.describe_snapshots(SnapshotIds=[res["backup_snapshot_id"]])["Snapshots"][0]["Tags"])
+    assert backup_tags["Name"] == "scratch"
+    assert statuses(actions.restore_volume(aws, settings, res["backup_snapshot_id"])) == ["done"]
+    assert statuses(actions.restore_volume(aws, settings, old_backup)) == ["done"]
+
+    pid = make_plan(aws, settings, [("instance", "stop_instance", inst)])
+    assert statuses(actions.stop_instances(aws, settings, pid, [inst["InstanceId"]], signoff=SIG)) == ["done"]
+    assert statuses(actions.start_instances(aws, settings, [inst["InstanceId"]])) == ["done"]
+    pid = make_plan(aws, settings, [("address", "quarantine_address", addr)])
+    assert statuses(actions.quarantine_addresses(aws, settings, pid, [addr["AllocationId"]], signoff=SIG)) == ["done"]
+    assert statuses(actions.cancel_address_quarantine(aws, settings, addr["AllocationId"])) == ["done"]
+    pid = make_plan(aws, settings, [("snapshot", "recycle_snapshot", snap)])
+    assert statuses(actions.recycle_snapshots(aws, settings, pid, [snap["SnapshotId"]], signoff=SIG)) == ["done"]
+
+    offending = [(name, key) for name, _, tags in writes for key in tags if key.strip().lower() == "warden:protect"]
+    assert offending == []
+    assert {"create_snapshot", "create_volume", "create_tags", "delete_tags"} <= {name for name, _, _ in writes}
+
+
+def test_ledger_failure_after_mutation_keeps_the_receipt(aws, settings, monkeypatch):  # finding 4
+    inst = make_instance(aws)
+    iid = inst["InstanceId"]
+    pid = make_plan(aws, settings, [("instance", "stop_instance", inst)])
+
+    def ledger_locked(*a, **k):
+        raise PermissionError("audit.jsonl is locked by OneDrive")
+
+    monkeypatch.setattr(audit, "audit", ledger_locked)
+    receipt = actions.stop_instances(aws, settings, pid, [iid], signoff=SIG)
+
+    assert statuses(receipt) == ["done"], receipt
+    assert "audit.jsonl is locked" in receipt["ledger_error"]
+    saved = audit.load_receipt(settings, receipt["receipt_id"])
+    assert saved is not None and saved["results"][0]["status"] == "done" and saved.get("ledger_error")
+    started = actions.start_instances(aws, settings, [iid])  # the undo still finds the stop receipt
+    assert statuses(started) == ["done"], started

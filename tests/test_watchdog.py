@@ -174,6 +174,38 @@ def test_verify_blocks_ami_referenced_snapshot(aws, settings):
     assert result["approved_ids"] == [free["SnapshotId"]] and result["token"]
 
 
+def test_verify_blocks_snapshot_used_by_launch_template(aws, settings):  # review #11
+    snap, free = make_snapshot(aws), make_snapshot(aws)
+    sid = snap["SnapshotId"]
+    lt = aws.ec2.create_launch_template(
+        LaunchTemplateName="data-seeded",
+        LaunchTemplateData={"ImageId": AMI, "BlockDeviceMappings": [
+            {"DeviceName": "/dev/sdg", "Ebs": {"SnapshotId": sid}}]},
+    )["LaunchTemplate"]["LaunchTemplateId"]
+    pid = make_plan(aws, settings, [("snapshot", "recycle_snapshot", snap), ("snapshot", "recycle_snapshot", free)])
+    result = watchdog.verify(aws, settings, pid, "recycle_snapshot", [sid, free["SnapshotId"]])
+    assert result["blocked"][sid] == f"used by launch template data-seeded ({lt}) - launches would fail"
+    assert result["approved_ids"] == [free["SnapshotId"]] and result["token"]
+    assert any("launch template" in c for c in result["checks"])
+
+
+def test_verify_fails_closed_when_launch_templates_cannot_be_listed(aws, settings, monkeypatch):  # review #11
+    from botocore.exceptions import ClientError
+
+    snap = make_snapshot(aws)
+    sid = snap["SnapshotId"]
+    pid = make_plan(aws, settings, [("snapshot", "recycle_snapshot", snap)])
+
+    def denied(*a, **k):
+        raise ClientError({"Error": {"Code": "UnauthorizedOperation", "Message": "x"}}, "DescribeLaunchTemplates")
+
+    monkeypatch.setattr(aws.ec2, "describe_launch_templates", denied)
+    monkeypatch.setattr(aws.ec2, "can_paginate", lambda name: False)
+    result = watchdog.verify(aws, settings, pid, "recycle_snapshot", [sid])
+    assert result["token"] is None
+    assert result["blocked"][sid] == "could not check which launch templates use it (UnauthorizedOperation)"
+
+
 def test_verify_blocks_instance_in_target_group(aws, settings, monkeypatch):
     inst = make_instance(aws)
     iid = inst["InstanceId"]

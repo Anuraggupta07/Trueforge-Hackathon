@@ -23,6 +23,7 @@ TAG_RESTORE_IOPS = "warden:restore-iops"
 TAG_RESTORE_THROUGHPUT = "warden:restore-throughput"
 TAG_PLAN_ID = "warden:plan-id"
 TAG_RESTORED_FROM = "warden:restored-from"
+TAG_HUMAN_UNDO_AT = "warden:human-undo-at"  # set by every undo tool; the scanner then never re-proposes that resource
 TAG_QUARANTINED_AT = "warden:quarantined-at"
 TAG_QUARANTINED_UNTIL = "warden:quarantined-until"
 DEMO_TAG = ("warden:demo", "true")
