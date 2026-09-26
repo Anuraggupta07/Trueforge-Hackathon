@@ -225,7 +225,7 @@ def watchdog_ui(result: dict) -> str:
     checks = (result.get("checks") or [])[:10]
     lines = [
         ("wd = Callout(\"success\", " + _q(f"🛡️ Watchdog signed off {len(approved)} item(s)") + ", "
-         + _q(f"Action {result.get('action')} · single-use sign-off {result.get('signoff_id')} · expires {result.get('expires_at')}", 300) + ")")
+         + _q(f"Action {result.get('action')} · single-use, HMAC-signed · expires {result.get('expires_at')}", 300) + ")")
         if approved else
         ("wd = Callout(\"error\", \"Watchdog blocked this request\", " + _q("Nothing will be executed.") + ")"),
         "wdsteps = Steps(" + _arr(f"StepsItem({_q('Check ' + str(i))}, {_q(c, 240)})" for i, c in enumerate(checks, 1)) + ")"

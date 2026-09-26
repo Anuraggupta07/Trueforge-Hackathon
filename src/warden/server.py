@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import threading
 import time
+import re
+import json
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -116,6 +118,20 @@ def _console_url(settings: Settings) -> str:
     """Where Warden's read-only console is served (same server, loopback)."""
     host = "127.0.0.1" if settings.host in ("0.0.0.0", "::", "") else settings.host
     return f"http://{host}:{settings.port}/console"
+
+
+def _resolve_name(settings: Settings, wanted: str) -> str:
+    """Map a resource Name tag (e.g. 'warden-demo-prod-db-disk') to its id via the last scan; ids pass through."""
+    if re.match(r"^(vol|snap|i|eipalloc|ami|lt)-[0-9a-f]+$", wanted):
+        return wanted
+    try:
+        report = json.loads((settings.state_dir / "last_scan.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return wanted
+    for f in report.get("findings") or []:
+        if str(f.get("name") or "").lower() == wanted.lower():
+            return str(f.get("resource_id"))
+    return wanted
 
 def _with_ui(result: dict, build: Callable[[dict], str]) -> dict:
     """Attach a ready-to-paste OpenUI dashboard (see warden.ui) unless the call failed."""
@@ -368,7 +384,15 @@ def list_warden_backups() -> dict[str, Any]:
     annotations=_READ,
 )
 def watchdog_verify(plan_id: str, action: str, resource_ids: list[str]) -> dict[str, Any]:
-    return _run(lambda s, c: _with_ui(watchdog.verify(c, s, plan_id, action, _ids(resource_ids)), _ui.watchdog_ui))
+    def body(settings: Settings, clients: AwsClients) -> dict:
+        result = _with_ui(watchdog.verify(clients, settings, plan_id, action, _ids(resource_ids)), _ui.watchdog_ui)
+        # Expose exactly one thing to pass on: the full signed sign-off. A live test showed a model copying
+        # the bare signoff_id instead of the token, so the id is not returned to the model at all.
+        result["signoff"] = result.pop("token", None)
+        result.pop("signoff_id", None)
+        return result
+
+    return _run(body)
 
 
 @server.tool(
@@ -398,9 +422,12 @@ def rollback_window() -> dict[str, Any]:
 def resource_history(resource_id: str, limit: int = 50) -> dict[str, Any]:
     def body(settings: Settings, clients: AwsClients) -> dict:
         capped = max(1, min(int(limit), 500))
-        entries = audit.history(settings, str(resource_id).strip(), limit=capped)
+        wanted = str(resource_id).strip()
+        resolved = _resolve_name(settings, wanted)
+        entries = audit.history(settings, resolved, limit=capped)
         return {
-            "resource_id": resource_id,
+            "resource_id": resolved,
+            "asked_for": wanted,
             "count": len(entries),
             "entries": entries,
             "ledger": audit.verify_ledger(settings),

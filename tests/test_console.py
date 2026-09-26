@@ -118,7 +118,7 @@ def test_rollback_receipts_and_ledger_after_a_quarantine(client, wired) -> None:
     vol = _volume(clients.ec2, "old-data")
     plan_id = server.scan_for_waste()["plan_id"]
     signed = server.watchdog_verify(plan_id, "quarantine_volume", [vol])
-    receipt = server.quarantine_volumes(plan_id, [vol], signed["token"])
+    receipt = server.quarantine_volumes(plan_id, [vol], signed["signoff"])
     assert receipt["counts"]["done"] == 1, receipt
     console.clear_cache()
     state = client.get("/console/api/state").json()

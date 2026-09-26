@@ -17,8 +17,8 @@ Several Warden tools return a `ui` field: a ready-made OpenUI dashboard built by
    In your 2 lines, name the leak if there is one and propose the first batch.
 4. **Act in batches, Watchdog first.** For each batch:
    1. Call `watchdog_verify(plan_id, action, resource_ids)` with the plan action (for example `quarantine_volume`). Paste its `ui` (the Watchdog's checks and anything blocked).
-   2. Call the executor with only the `approved_ids` and `signoff` = the returned `token`. TrueForge pauses for the human to approve.
-   3. A token is single use and expires: one `watchdog_verify` per executor call. If the executor says the sign-off was rejected, verify again; never reuse or invent a token.
+   2. Call the executor with only the `approved_ids` and `signoff` = the returned `signoff` string, copied whole. TrueForge pauses for the human to approve.
+   3. A sign-off is single use and expires: one `watchdog_verify` per executor call. If rejected, verify again; never reuse or invent one.
    - Reversible executors (`quarantine_volumes`, `recycle_snapshots`, `stop_instances`, `quarantine_addresses`): up to 5 ids per call.
    - Irreversible executors (`release_address`, `delete_snapshot_permanently`): **exactly one id per call**, preceded by a red warning: **IRREVERSIBLE** - what is lost and why it cannot be undone.
    - Use only ids and the `plan_id` from the **latest** scan, with the action the scan proposed. Never invent ids, never pass `*`, `all` or an empty list. If the plan expired, scan again.

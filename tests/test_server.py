@@ -128,26 +128,26 @@ def test_end_to_end_volume_with_watchdog_signoff(wired) -> None:
 
     # The Watchdog blocks the keep id, wildcards and unknown plans; it approves only the act id.
     blocked = server.watchdog_verify(plan_id, "quarantine_volume", [keep_vol])
-    assert blocked["token"] is None and keep_vol in blocked["blocked"]
-    assert server.watchdog_verify(plan_id, "quarantine_volume", ["*"])["token"] is None
-    assert server.watchdog_verify("plan-nope", "quarantine_volume", [act_vol])["token"] is None
+    assert blocked["signoff"] is None and keep_vol in blocked["blocked"]
+    assert server.watchdog_verify(plan_id, "quarantine_volume", ["*"])["signoff"] is None
+    assert server.watchdog_verify("plan-nope", "quarantine_volume", [act_vol])["signoff"] is None
 
     signed = server.watchdog_verify(plan_id, "quarantine_volume", [act_vol])
-    assert signed["approved_ids"] == [act_vol] and signed["token"], signed
+    assert signed["approved_ids"] == [act_vol] and signed["signoff"], signed
     assert any("fingerprint" in line for line in signed["checks"])
 
     # A token signed for one id cannot carry another (and a rejection does not consume it).
-    smuggle = server.quarantine_volumes(plan_id, [act_vol, keep_vol], signed["token"])
+    smuggle = server.quarantine_volumes(plan_id, [act_vol, keep_vol], signed["signoff"])
     assert smuggle["counts"]["done"] == 0
 
-    receipt = server.quarantine_volumes(plan_id, [act_vol], signed["token"])
+    receipt = server.quarantine_volumes(plan_id, [act_vol], signed["signoff"])
     assert receipt["counts"] == {"done": 1, "skipped": 0, "failed": 0}, receipt
     result = receipt["results"][0]
     backup = result["backup_snapshot_id"]
     assert result["undo"] == {"tool": "restore_volume", "args": {"backup_snapshot_id": backup}}
 
     # Single use: replaying the same sign-off is rejected.
-    replay = server.quarantine_volumes(plan_id, [act_vol], signed["token"])
+    replay = server.quarantine_volumes(plan_id, [act_vol], signed["signoff"])
     assert replay["counts"]["done"] == 0
     assert "already used" in replay["results"][0]["detail"]
 
@@ -194,17 +194,17 @@ def test_end_to_end_elastic_ip_quarantine_then_release(wired, clock) -> None:
 
     signed = server.watchdog_verify(plan_id, "quarantine_address", [alloc])
     assert signed["approved_ids"] == [alloc], signed
-    receipt = server.quarantine_addresses(plan_id, [alloc], signed["token"])
+    receipt = server.quarantine_addresses(plan_id, [alloc], signed["signoff"])
     assert receipt["counts"]["done"] == 1, receipt
     assert receipt["results"][0]["undo"] == {"tool": "cancel_address_quarantine", "args": {"allocation_id": alloc}}
     assert receipt["est_monthly_savings_usd"] == 0
 
     # An immediate release is refused: by the plan, the scan, the Watchdog and the executor.
-    assert server.watchdog_verify(plan_id, "release_address", [alloc])["token"] is None
+    assert server.watchdog_verify(plan_id, "release_address", [alloc])["signoff"] is None
     rescan = server.scan_for_waste()
     early = {f["resource_id"]: f for f in rescan["findings"]}[alloc]
     assert early["verdict"] == "keep" and "releasable in" in early["reasons"][0]
-    assert server.watchdog_verify(rescan["plan_id"], "release_address", [alloc])["token"] is None
+    assert server.watchdog_verify(rescan["plan_id"], "release_address", [alloc])["signoff"] is None
     refused = server.release_address(rescan["plan_id"], alloc, "wd-20260101T000000-abcdef." + "0" * 64)
     assert refused["counts"]["done"] == 0
     assert ec2.describe_addresses(AllocationIds=[alloc])["Addresses"]
@@ -225,7 +225,7 @@ def test_end_to_end_elastic_ip_quarantine_then_release(wired, clock) -> None:
 
     sig = server.watchdog_verify(later["plan_id"], "release_address", [alloc])
     assert sig["approved_ids"] == [alloc], sig
-    released = server.release_address(later["plan_id"], alloc, sig["token"])
+    released = server.release_address(later["plan_id"], alloc, sig["signoff"])
     assert released["counts"]["done"] == 1, released
     assert not ec2.describe_addresses()["Addresses"]
 
@@ -239,7 +239,7 @@ def test_cancel_address_quarantine_undoes_the_tags(wired) -> None:
     assert server.cancel_address_quarantine(alloc)["counts"]["done"] == 0  # not quarantined: refused
     report = server.scan_for_waste()
     sig = server.watchdog_verify(report["plan_id"], "quarantine_address", [alloc])
-    assert server.quarantine_addresses(report["plan_id"], [alloc], sig["token"])["counts"]["done"] == 1
+    assert server.quarantine_addresses(report["plan_id"], [alloc], sig["signoff"])["counts"]["done"] == 1
     undone = server.cancel_address_quarantine(alloc)
     assert undone["counts"]["done"] == 1, undone
     tags = {t["Key"] for t in ec2.describe_addresses(AllocationIds=[alloc])["Addresses"][0].get("Tags", [])}
@@ -270,7 +270,7 @@ def test_status_reports_runtime_freeze_file(wired, tmp_path) -> None:  # S14
     assert server.warden_status()["freeze"] is True
     report = server.scan_for_waste()
     frozen = server.watchdog_verify(report["plan_id"], "quarantine_volume", ["vol-1"])
-    assert frozen["token"] is None and "frozen" in frozen["blocked"]["vol-1"]
+    assert frozen["signoff"] is None and "frozen" in frozen["blocked"]["vol-1"]
 
 
 def test_scan_description_says_review_needs_a_tag_and_rescan() -> None:  # demo F4
