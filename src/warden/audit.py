@@ -3,7 +3,8 @@
 Every audit.jsonl line carries seq (1-based), prev_hash ("GENESIS" for the first chained entry) and
 hash = sha256(prev_hash + canonical JSON of the entry without "hash"). Editing, deleting or reordering a
 line breaks the chain, which verify_ledger() reports. The newest (seq, hash) is also kept in state_dir/ledger.head,
-so a truncated tail or a deleted ledger is reported too. The chain is not signed: someone who can rewrite both
+so a truncated tail or a deleted ledger is reported too. A write never moves the head anchor back over such a
+break: once the ledger falls behind its head, a ledger_tamper_detected entry is appended; the old anchor is kept in state_dir/ledger.broken, so verify_ledger keeps reporting the break. The chain is not signed: someone who can rewrite both
 files consistently can still forge history.
 """
 
@@ -19,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .config import TAG_QUARANTINED_AT, Settings
+from .config import TAG_QUARANTINED_AT, TAG_QUARANTINED_UNTIL, Settings
 
 _PREFIXES = {"plan", "rcpt"}
 _RECEIPT_ID = re.compile(r"^rcpt-[A-Za-z0-9-]+$")
@@ -53,6 +54,7 @@ def write_json_atomic(path: Path, data: Any) -> Path:
 GENESIS = "GENESIS"
 LEDGER_FILE = "audit.jsonl"
 HEAD_FILE = "ledger.head"
+BREAK_FILE = "ledger.broken"  # sticky record of a detected truncation/rewrite
 _LEDGER_LOCK = threading.Lock()
 _TAIL_CHUNK = 8192
 
@@ -105,19 +107,53 @@ def _last_chained(path: Path) -> tuple[int, str]:
     return 0, GENESIS
 
 
+def _head_behind(head: dict | None, seq: int, tail_hash: str) -> bool:
+    """True when the ledger no longer reaches its head anchor (truncated, deleted or tail rewritten)."""
+    if head is None:
+        return False
+    head_seq = head.get("seq")
+    if not isinstance(head_seq, int):
+        return True  # unreadable anchor: never overwrite it silently
+    return head_seq > seq or (head_seq == seq and head.get("hash") != tail_hash)
+
+
+def _read_break(settings: Settings) -> dict | None:
+    try:
+        data = json.loads((settings.state_dir / BREAK_FILE).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return {"reason": f"{BREAK_FILE} is unreadable"}
+    return data if isinstance(data, dict) else {"reason": f"{BREAK_FILE} is unreadable"}
+
+
 def audit(settings: Settings, event: str, **fields: Any) -> None:
     """Append one hash-chained JSON line to state_dir/audit.jsonl (thread-safe)."""
     settings.state_dir.mkdir(parents=True, exist_ok=True)
     path = _ledger_path(settings)
     with _LEDGER_LOCK:
         seq, prev_hash = _last_chained(path)
-        # Round-trip through JSON so the hashed form is exactly what a reader will parse back.
-        entry = json.loads(json.dumps({"ts": iso_now(), "event": event, **fields}, default=str))
-        entry["seq"] = seq + 1
-        entry["prev_hash"] = prev_hash
-        entry["hash"] = _entry_hash(prev_hash, entry)
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry, default=str) + "\n")
+        head = _read_head(settings)
+        records: list[tuple[str, dict]] = [(event, fields)]
+        if _head_behind(head, seq, prev_hash) and _read_break(settings) is None:
+            # The ledger was truncated, deleted or its tail rewritten. Record the old anchor in a sticky file
+            # before this write moves the head, so verify_ledger keeps reporting the break (not laundered).
+            detail = (f"{HEAD_FILE} anchored seq {(head or {}).get('seq')!r} but the ledger ends at seq {seq}; "
+                      "entries were removed or rewritten")
+            write_json_atomic(settings.state_dir / BREAK_FILE,
+                              {"detected_at": iso_now(), "head": head, "ledger_seq": seq, "reason": detail})
+            records.insert(0, ("ledger_tamper_detected", {"detail": detail}))
+        entry: dict = {}
+        for name, data in records:
+            # Round-trip through JSON so the hashed form is exactly what a reader will parse back.
+            entry = json.loads(json.dumps({"ts": iso_now(), "event": name, **data}, default=str))
+            entry["seq"] = seq + 1
+            entry["prev_hash"] = prev_hash
+            entry["hash"] = _entry_hash(prev_hash, entry)
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, default=str) + "
+")
+            seq, prev_hash = entry["seq"], entry["hash"]
         # Anchor the head outside the file so a truncated tail or a deleted ledger is detectable. Best effort:
         # a head that lags (e.g. Windows briefly locks the file) still verifies, it only anchors less.
         try:
@@ -189,6 +225,11 @@ def verify_ledger(settings: Settings) -> dict:
         return broken(
             f"ledger truncated: {HEAD_FILE} records seq {head_seq!r} but the ledger ends at seq {expected_seq - 1}"
         )
+    sticky = _read_break(settings)
+    if sticky is not None:
+        return {"ok": False, "entries": entries, "broken_at_seq": sticky.get("ledger_seq"),
+                "reason": f"ledger was truncated or rewritten earlier ({sticky.get('reason')}; detected "
+                          f"{sticky.get('detected_at')}, see {BREAK_FILE})"}
     return {"ok": True, "entries": entries, "broken_at_seq": None, "reason": None}
 
 

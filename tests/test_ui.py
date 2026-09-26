@@ -63,7 +63,7 @@ def test_scan_ui_is_valid_and_shows_everything():
     program = ui.scan_ui(REPORT, mock=True)
     check_program(program)
     for text in ("vol-1", "eipalloc-1", "IRREVERSIBLE", "Prompt-injection attempt", "Production", "Leak: lt-a",
-                 "Simulated AWS", "Request approval", "Approve plan plan-1: quarantine_volume vol-1"):
+                 "Simulated AWS", "Request approval", "Decide: 3 item(s)", "Why it is safe", "Approve plan plan-1: quarantine_volume vol-1"):
         assert text in program
 
 

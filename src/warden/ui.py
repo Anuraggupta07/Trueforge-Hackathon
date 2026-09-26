@@ -95,43 +95,44 @@ def scan_ui(report: dict, mock: bool = False) -> str:
         _kpi("k3", "Needs your review", str(tiers.get("needs_review", 0)), "irreversible or unclear"),
         _kpi("k4", "Refused (protected)", str(tiers.get("protected", 0)), "Warden will not touch these"),
         _kpi("k5", "Leaks found", str(len(leaks)), "sources that keep creating waste"),
-        "tabs = Tabs([t1, t2, t3, t4, t5])",
+        "tabs = Tabs([t5, t4, t3, t6, t2])",
     ]
 
-    # Tab 1: the decision list.
+    # The decision list sits above the tabs so it is always visible; TrueForge opens the last tab (Refused).
+    decide: list[str] = []
     if act:
-        names = [_q(f.get("name") or f.get("resource_id"), 48) for f in act]
-        ids = [_q(f.get("resource_id")) for f in act]
-        kinds = [_q(TYPE_LABELS.get(f.get("resource_type"), f.get("resource_type"))) for f in act]
+        names = [_q(f.get("name") or f.get("resource_id"), 34) for f in act]
         actions = [_tag(ACTION_LABELS.get(f.get("action") or "", "Needs your call"),
                         "danger" if f.get("reversible") is False else "info") for f in act]
         undo = [_tag("Reversible", "success") if f.get("reversible") else
                 _tag("IRREVERSIBLE", "danger") if f.get("reversible") is False else _tag("Decide first", "warning")
                 for f in act]
-        costs = [_num(f.get("est_monthly_usd")) for f in act]
         whys = [_q(f.get("why") or "; ".join(f.get("reasons") or []), 180) for f in act]
         btns = [_button("Request approval" if f.get("verdict") == "act" else "Discuss",
                         (f"Approve plan {plan_id}: {f.get('action')} {f.get('resource_id')}" if f.get("verdict") == "act"
                          else f"Explain what you need from me to decide on {f.get('resource_id')}"),
                         "primary" if f.get("reversible") else "secondary")
                 for f in act]
-        lines += [
-            "t1 = TabItem(\"decide\", " + _q(f"Decide ({len(act)})") + ", [intro1, dtable, dbtns])",
+        decide += [
+            "decide = Card([dhdr, intro1, dtable, dbtns])",
+            "dhdr = CardHeader(" + _q(f"Decide: {len(act)} item(s)") + ", \"Most urgent first\")",
             "intro1 = TextContent(\"Each click only REQUESTS an action: Warden's independent Watchdog re-checks it, "
             "then TrueForge shows you an Allow / Deny card. Nothing changes before you click Allow.\", \"small\")",
-            "dtable = Table([Col(\"Resource\", " + _arr(names) + "), Col(\"ID\", " + _arr(ids) + "), Col(\"Type\", "
-            + _arr(kinds) + "), Col(\"Action\", " + _arr(actions) + "), Col(\"Undo\", " + _arr(undo)
-            + "), Col(\"$/month\", " + _arr(costs) + ", \"number\"), Col(\"Why\", " + _arr(whys)
-            + "), Col(\"\", " + _arr(btns) + ", \"action\")])",
+            "dtable = Table([Col(\"Resource\", " + _arr(names) + "), Col(\"Action\", " + _arr(actions)
+            + "), Col(\"Undo\", " + _arr(undo) + "), Col(\"\", "
+            + _arr(btns) + ", \"action\")])",
+            "t6 = TabItem(\"why\", \"Why it is safe\", [whysteps])",
+            "whysteps = Steps(" + _arr(f"StepsItem({n}, {w})" for n, w in zip(names, whys)) + ")",
         ]
         safe_ids = [f.get("resource_id") for f in act if f.get("tier") == "safe_reversible"]
         batch = [_button("Request approval for all safe & reversible items",
                          f"Approve plan {plan_id}: every safe & reversible item ({', '.join(safe_ids)}), "
                          "batched by action, one Watchdog sign-off and one approval per batch", "primary")] if safe_ids else []
         batch.append(_button("Show the rollback window", "Show the rollback window"))
-        lines.append("dbtns = Buttons(" + _arr(batch) + ")")
+        decide.append("dbtns = Buttons(" + _arr(batch) + ")")
     else:
-        lines += ["t1 = TabItem(\"decide\", \"Decide (0)\", [none1])",
+        decide += ["decide = Card([none1])", "t6 = TabItem(\"why\", \"Why it is safe\", [none6])",
+                   "none6 = TextContent(\"Nothing to act on.\")",
                   "none1 = Callout(\"success\", \"Nothing to clean\", \"No waste found in scope.\")"]
 
     # Tab 2: refusals are a feature.
@@ -139,11 +140,11 @@ def scan_ui(report: dict, mock: bool = False) -> str:
         lines += [
             "t2 = TabItem(\"refused\", " + _q(f"Refused ({len(keep)})") + ", [intro2, ptable])",
             "intro2 = TextContent(\"A normal cleanup script would delete these. Warden refuses, and says why.\", \"small\")",
-            "ptable = Table([Col(\"Resource\", " + _arr(_q(f.get("name") or f.get("resource_id"), 60) for f in keep)
-            + "), Col(\"ID\", " + _arr(_q(f.get("resource_id")) for f in keep) + "), Col(\"Refused because\", "
+            "ptable = Table([Col(\"Resource\", " + _arr(_q(f.get("name") or f.get("resource_id"), 40) for f in keep)
+            + "), Col(\"Refused because\", "
             + _arr(_tag(_refusal_kind(f), "danger" if "suspicious" in " ".join(f.get("reasons") or []) else "warning")
                    for f in keep)
-            + "), Col(\"Details\", " + _arr(_q(f.get("why") or "; ".join(f.get("reasons") or []), 200) for f in keep) + ")])",
+            + "), Col(\"Details\", " + _arr(_q((f.get("reasons") or [f.get("why")])[0], 90) for f in keep) + ")])",
         ]
     else:
         lines += ["t2 = TabItem(\"refused\", \"Refused (0)\", [none2])",
@@ -185,12 +186,13 @@ def scan_ui(report: dict, mock: bool = False) -> str:
         "and a live rollback countdown.\")])",
     ]
 
+    lines += decide
     children = ["hdr"]
     mode = _mode_callout(mock)
     if mode:
         children.append("mode")
         lines.append(mode)
-    children += ["kpis", "tabs"]
+    children += ["kpis", "decide", "tabs"]
     return _program(children, lines)
 
 
@@ -198,7 +200,8 @@ def _refusal_kind(finding: dict) -> str:
     text = " ".join(finding.get("reasons") or []).lower()
     for needle, label in (("suspicious", "Prompt-injection attempt"), ("production", "Production"),
                           ("legal", "Legal hold"), ("terraform", "Managed by code"), ("cloudformation", "Managed by code"),
-                          ("autoscaling", "Autoscaling"), ("kubernetes", "Kubernetes"), ("ami", "Used by an image"),
+                          ("used by ami", "Used by an image"), ("machine image", "Used by an image"), ("autoscaling", "Autoscaling"),
+                          ("kubernetes", "Kubernetes"),
                           ("dns", "DNS still points here"), ("load balancer", "Serving traffic"),
                           ("backup", "Warden backup"), ("quarantine", "In quarantine"), ("active", "In use")):
         if needle in text:
