@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import time
 from functools import cached_property
 from typing import Any, Callable
 
 import boto3
 from botocore.config import Config
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, WaiterError
 
 from .config import Settings
 
@@ -57,6 +58,25 @@ def error_code(err: Exception) -> str:
     if isinstance(err, ClientError):
         return str(err.response.get("Error", {}).get("Code") or "Unknown")
     return type(err).__name__
+
+
+def wait_for(
+    client: Any, waiter_name: str, delay: int, max_attempts: int, sleep: Callable[[float], Any] = time.sleep,
+    **kwargs: Any,
+) -> None:
+    """client.get_waiter(name).wait(...), but retry *.NotFound (EC2 is eventually consistent right after a
+    create; the snapshot_completed and volume_available waiters would otherwise fail on the first poll)."""
+    attempts = max(1, max_attempts)
+    while True:
+        try:
+            client.get_waiter(waiter_name).wait(WaiterConfig={"Delay": delay, "MaxAttempts": attempts}, **kwargs)
+            return
+        except WaiterError as err:
+            code = str(((err.last_response or {}).get("Error") or {}).get("Code") or "")
+            if not code.endswith("NotFound") or attempts <= 1:
+                raise
+            attempts -= 1
+            sleep(delay)
 
 
 def dry_run(call: Callable[..., Any], **kwargs: Any) -> str:

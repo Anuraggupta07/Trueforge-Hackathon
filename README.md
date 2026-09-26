@@ -6,6 +6,8 @@ Built on [TrueForge](https://github.com/truefoundry/trueforge) for **Agents That
 
 > 🚧 v1 is being built today. Setup steps and a demo video link will be added here before submission.
 
+**Run it:** start the Warden MCP server with `uv run warden-server` (it listens on `http://127.0.0.1:8000/mcp`), start TrueForge with `OUTBOUND_URL_ALLOWED_HOSTS='["127.0.0.1"]'` (its outbound URL guard blocks loopback hosts by default), then register the agent with `uv run python agent/setup_agent.py`. Plant the demo with `uv run python scripts/plant.py` at least ~25 minutes before scanning, so the idle server has post-boot CloudWatch data.
+
 ---
 
 ## The problem
@@ -41,8 +43,8 @@ Each resource type has its own safe path:
 
 ## Proof before action: what Warden checks
 
-1. **Protected tags:** `production`, `legal-hold` and `dr` are never touched. The code refuses, and a shipped IAM policy makes **AWS itself** refuse too (two independent locks).
-2. **Managed by code or autoscaling:** Terraform, CloudFormation, autoscaling and Kubernetes resources are skipped, because they would come back or break deploys.
+1. **Protected tags:** `production`, `legal-hold` and `dr` are never touched. The code refuses, and a shipped IAM policy makes **AWS itself** refuse too (two independent locks). See [iam/README.md](iam/README.md) for the exact tag keys and values.
+2. **Managed by code or autoscaling:** Terraform, CloudFormation, autoscaling, Kubernetes (EKS, EBS CSI volumes), AWS Backup and Data Lifecycle Manager resources are skipped, because they would come back or break deploys.
 3. **Dependency chain:** snapshot → AMI → launch template. If anything uses it, Warden keeps it, because autoscaling would break.
 4. **Activity:** CloudWatch CPU and network over a look-back window. With no data yet, the verdict is "review", not "act".
 5. **Owner:** who created the resource, from CloudTrail.
@@ -54,7 +56,7 @@ Each resource type has its own safe path:
 ### Safety locks
 
 - **Plan lock:** actions only accept resource IDs that the scanner certified in the current plan. This blocks the "wrong list of IDs" class of incident.
-- **Freeze switch:** `WARDEN_FREEZE=true` blocks every action, for example during quarter-end change freezes.
+- **Freeze switch:** `WARDEN_FREEZE=true` blocks every action, for example during quarter-end change freezes. It is read when the server starts; to freeze a running server instantly, create the file `.warden/FREEZE`.
 - **Scope guard:** Warden can be limited to resources carrying a specific tag.
 - **Audit log:** every action and its outcome is logged.
 - **No new waste:** Warden's own backups expire after 7 days.

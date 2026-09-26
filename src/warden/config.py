@@ -57,6 +57,14 @@ class Settings:
         return f"{self.scope_tag_key}={self.scope_tag_value}"
 
 
+FREEZE_FILE = "FREEZE"
+
+
+def is_frozen(settings: Settings) -> bool:
+    """WARDEN_FREEZE (read at start-up) or a <state_dir>/FREEZE file, checked on every call (no restart)."""
+    return settings.freeze or (settings.state_dir / FREEZE_FILE).exists()
+
+
 def _get(env: Mapping[str, str], name: str) -> str | None:
     value = env.get(name)
     if value is None:
@@ -103,6 +111,16 @@ def _bool(env: Mapping[str, str], name: str, default: bool) -> bool:
     raise ValueError(f"{name} must be true or false, got {raw!r}")
 
 
+def _profile_region(env: Mapping[str, str]) -> str | None:
+    """Region from the standard AWS config chain (AWS_PROFILE / ~/.aws/config), or None."""
+    try:
+        import boto3
+
+        return boto3.Session(profile_name=_get(env, "AWS_PROFILE")).region_name
+    except Exception:  # unknown profile, unreadable config...
+        return None
+
+
 def _scope(env: Mapping[str, str]) -> tuple[str | None, str | None]:
     raw = _get(env, "WARDEN_SCOPE_TAG")
     if raw is None:
@@ -125,7 +143,8 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
     max_batch = min(20, max(1, _int(env, "WARDEN_MAX_BATCH", 5, minimum=None)))
     state_raw = _get(env, "WARDEN_STATE_DIR")
     return Settings(
-        region=_get(env, "AWS_REGION") or _get(env, "AWS_DEFAULT_REGION") or "us-east-1",
+        region=(_get(env, "AWS_REGION") or _get(env, "AWS_DEFAULT_REGION") or _profile_region(env)
+                or "us-east-1"),
         scope_tag_key=scope_key,
         scope_tag_value=scope_value,
         freeze=_bool(env, "WARDEN_FREEZE", False),

@@ -66,10 +66,12 @@ REPORTER_INSTRUCTIONS = """\
 You are the read-only reporting mode of Warden, a cloud-cost cleanup agent. You run \
 unattended, so you have no tools that change anything, and you never propose to call any.
 
-1. Call `warden_status`, then `scan_for_waste`.
-2. In the sandbox, write the scan JSON to `scan.json`. Run a short Python script that prints \
-the number of findings per verdict, reversible vs irreversible proposed actions, estimated \
-monthly savings (list-price estimates), and the number of leaks. Report its output.
+1. Call `warden_status`.
+2. Never copy tool JSON by hand. In the sandbox, run one Python script that fetches the scan \
+itself (`from mcp_client import call_tool`, then `scan = await call_tool("warden", "scan_for_waste", {})`) \
+and prints the plan_id, one line per finding, every leak with its fix, the number of findings per \
+verdict, reversible vs irreversible proposed actions, estimated monthly savings (list-price \
+estimates), and the number of leaks. Report its output.
 3. Produce a short report: a findings table (resource, type, verdict, proposed action, \
 est. $/month, main reason), every `keep` with its reason, and every leak with its fix.
 4. End with: "To act on this, open the `warden` agent and approve changes there." Include \
@@ -230,6 +232,19 @@ def apply(payloads: dict[str, Any], base_url: str, token: str | None) -> None:
         print(f"Agent '{agent['name']}' {verb} (id {agent_id})")
 
 
+def outbound_guard_hint(mcp_url: str) -> str:
+    """How to let TrueForge's outbound URL guard (on by default) reach a local Warden server."""
+    from urllib.parse import urlparse
+
+    host = urlparse(mcp_url).hostname or "127.0.0.1"
+    return (
+        f"TrueForge's outbound URL guard blocks private hosts such as {host!r}. Restart TrueForge with\n"
+        f"  OUTBOUND_URL_ALLOWED_HOSTS='[\"{host}\"]'\n"
+        "(the host must match WARDEN_MCP_URL exactly), or for a local-only demo NETWORK_POLICY_ENABLED=false,\n"
+        "then rerun this script."
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point."""
     parser = argparse.ArgumentParser(description="Register Warden with TrueForge.")
@@ -263,7 +278,10 @@ def main(argv: list[str] | None = None) -> int:
         body = getattr(err, "body", None)
         detail = f"HTTP {status}: {body}" if status else f"{type(err).__name__}: {err}"
         print(f"error: TrueForge at {base_url} rejected setup ({detail})", file=sys.stderr)
-        print("Is TrueForge running, and is TRUEFORGE_BASE_URL/TRUEFORGE_TOKEN correct?", file=sys.stderr)
+        if "Outbound URL blocked" in f"{body} {err}":
+            print(outbound_guard_hint(payloads["mcp_server"]["url"]), file=sys.stderr)
+        else:
+            print("Is TrueForge running, and is TRUEFORGE_BASE_URL/TRUEFORGE_TOKEN correct?", file=sys.stderr)
         return 1
     return 0
 

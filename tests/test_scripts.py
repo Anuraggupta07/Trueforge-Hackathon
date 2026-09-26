@@ -188,3 +188,78 @@ def test_preflight_reports_blocked_items(aws, settings):
     rb = {r["check"]: r for r in rows}["Recycle Bin"]
     assert rb["status"] == "BLOCKED" and "recycle_snapshot" in rb["disables"]
     assert "What the non-OK items disable" in preflight.render(rows)
+
+
+# ---------------------------------------------------------------- review fixes
+
+
+def test_default_subnet_skips_az_without_the_instance_type(aws, settings, monkeypatch):  # RA-5
+    import _common
+
+    subnets = aws.ec2.describe_subnets()["Subnets"]
+    target = sorted(s["AvailabilityZone"] for s in subnets)[-1]
+    seen: list[dict] = []
+
+    def offerings(**kw):
+        seen.append(kw)
+        return {"InstanceTypeOfferings": [{"InstanceType": "t3.micro", "LocationType": "availability-zone",
+                                           "Location": target}]}
+
+    monkeypatch.setattr(aws.ec2, "describe_instance_type_offerings", offerings)
+    subnet = _common.default_subnet(aws, "t3.micro")
+    assert subnet["AvailabilityZone"] == target
+    assert seen[0]["LocationType"] == "availability-zone"
+    assert seen[0]["Filters"] == [{"Name": "instance-type", "Values": ["t3.micro"]}]
+
+
+def test_plant_uses_an_az_that_offers_t3_micro(aws, settings, rbin, monkeypatch):  # RA-5
+    subnets = aws.ec2.describe_subnets()["Subnets"]
+    target = sorted(s["AvailabilityZone"] for s in subnets)[-1]
+    monkeypatch.setattr(aws.ec2, "describe_instance_type_offerings", lambda **kw: {
+        "InstanceTypeOfferings": [{"InstanceType": "t3.micro", "Location": target}]})
+    planter = plant.Planter(aws, settings, out=lambda _: None, waiter_delay=0)
+    planter.run()
+    assert planter.az == target
+
+
+def test_plant_wait_survives_not_found_right_after_create(aws, settings, monkeypatch):  # RA-2
+    from botocore.exceptions import WaiterError
+
+    calls: list[dict] = []
+
+    class Waiter:
+        def wait(self, **kw):
+            calls.append(kw)
+            if len(calls) == 1:
+                raise WaiterError(name="VolumeAvailable", reason="NotFound",
+                                  last_response={"Error": {"Code": "InvalidVolume.NotFound"}})
+
+    monkeypatch.setattr(aws.ec2, "get_waiter", lambda name: Waiter())
+    plant.Planter(aws, settings, out=lambda _: None, waiter_delay=0)._wait("volume_available", VolumeIds=["vol-1"])
+    assert len(calls) == 2
+
+
+def test_reset_retries_snapshot_still_in_use_by_deregistering_ami(aws, settings, rbin, monkeypatch):  # RA-10
+    _plant(aws, settings)
+    real_delete = aws.ec2.delete_snapshot
+    attempts: dict[str, int] = {}
+
+    def delete_snapshot(**kw):
+        sid = kw["SnapshotId"]
+        attempts[sid] = attempts.get(sid, 0) + 1
+        if attempts[sid] == 1:
+            raise ClientError({"Error": {"Code": "InvalidSnapshot.InUse", "Message": "in use by ami"}},
+                              "DeleteSnapshot")
+        return real_delete(**kw)
+
+    monkeypatch.setattr(aws.ec2, "delete_snapshot", delete_snapshot)
+    lines: list[str] = []
+    reset.reset(aws, settings, yes=True, out=lines.append, waiter_delay=0)
+    assert not [line for line in lines if "FAILED" in line], lines
+    assert not reset.find_demo_resources(aws)["snapshots"]
+
+
+def test_plant_reminder_covers_lookback_plus_boot(aws, settings, rbin):  # F4 / S12
+    lines, _ = _plant(aws, settings)
+    reminder = [line for line in lines if "idle server" in line and "minutes" in line]
+    assert reminder and "~10 minutes" not in reminder[0]

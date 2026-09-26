@@ -122,3 +122,11 @@ def test_via_in_memory_client(wired) -> None:
 
     status = asyncio.run(go())
     assert status["region"] == "us-east-1" and "approval_rule" in status
+
+
+def test_status_reports_runtime_freeze_file(wired, tmp_path) -> None:  # S14
+    assert server.warden_status()["freeze"] is False
+    state = tmp_path / "srv"
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "FREEZE").write_text("", encoding="utf-8")
+    assert server.warden_status()["freeze"] is True

@@ -6,6 +6,7 @@ re-describe -> scope + policy recheck -> fingerprint compare -> act -> verify ->
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
@@ -14,7 +15,7 @@ from botocore.exceptions import ClientError, WaiterError
 from . import audit as audit_mod
 from . import plan as plan_mod
 from . import policy, pricing
-from .aws import AwsClients, error_code
+from .aws import AwsClients, error_code, wait_for
 from .config import (
     TAG_BACKUP_OF,
     TAG_EXPIRES_AT,
@@ -30,10 +31,25 @@ from .config import (
     TAG_RESTORED_FROM,
     TAG_STOPPED_AT,
     Settings,
+    is_frozen,
 )
 
-FROZEN_DETAIL = "Warden is frozen (WARDEN_FREEZE=true)"
+FROZEN_DETAIL = "Warden is frozen (WARDEN_FREEZE=true or a FREEZE file in the state directory)"
 MAX_TAGS_PER_RESOURCE = 50
+# TrueForge aborts one MCP request after MCP_REQUEST_TIMEOUT_MS (default 240 s) while this server keeps
+# working, so a call's snapshot waits must finish well inside that.
+CALL_BUDGET_SECONDS = 180
+MIN_SNAPSHOT_WAIT_SECONDS = 10
+# EC2 reads lag writes by a few seconds; re-read this often before believing a stale answer.
+SETTLE_ATTEMPTS = 3
+SETTLE_DELAY_SECONDS = 2.0
+RBIN_ATTEMPTS = 6
+RBIN_DELAY_SECONDS = 2.0
+# Activity re-check right before stopping an instance.
+ACTIVITY_RECHECK_MINUTES = 15
+
+_sleep = time.sleep
+_clock = time.monotonic
 
 # Warden bookkeeping tags: stripped when restoring so the restored resource looks like the original.
 BOOKKEEPING_TAGS = frozenset(
@@ -109,6 +125,27 @@ def _to_aws_tags(tags: dict[str, str]) -> list[dict[str, str]]:
     return [{"Key": k, "Value": v} for k, v in tags.items()]
 
 
+def _settle(check: Callable[[], bool], attempts: int = SETTLE_ATTEMPTS, delay: float = SETTLE_DELAY_SECONDS) -> bool:
+    """True as soon as check() is true; re-reads a few times because EC2 is eventually consistent."""
+    for attempt in range(attempts):
+        if check():
+            return True
+        if attempt < attempts - 1:
+            _sleep(delay)
+    return False
+
+
+def _warden_results(settings: Settings, action: str, resource_id: str) -> list[tuple[dict, dict]]:
+    """(receipt, result) pairs from Warden's own receipts for this action and resource."""
+    out: list[tuple[dict, dict]] = []
+    for summary in audit_mod.list_receipts(settings, limit=100_000):
+        if summary.get("action") != action:
+            continue
+        receipt = audit_mod.load_receipt(settings, str(summary.get("receipt_id"))) or {}
+        out.extend((receipt, r) for r in receipt.get("results") or [] if r.get("resource_id") == resource_id)
+    return out
+
+
 def _new_receipt(clients: AwsClients, settings: Settings, action: str, plan_id: str | None) -> dict:
     return {
         "receipt_id": audit_mod.new_id("rcpt"),
@@ -118,7 +155,7 @@ def _new_receipt(clients: AwsClients, settings: Settings, action: str, plan_id: 
         "region": settings.region,
         "started_at": audit_mod.iso_now(),
         "finished_at": None,
-        "freeze": settings.freeze,
+        "freeze": is_frozen(settings),
         "results": [],
         "counts": {"done": 0, "skipped": 0, "failed": 0},
         "est_monthly_savings_usd": 0.0,
@@ -262,7 +299,7 @@ def _run_gated(
     """Shared freeze -> validate -> recheck -> act loop for plan-gated actions."""
     receipt = _new_receipt(clients, settings, action, plan_id if isinstance(plan_id, str) else None)
     requested = _requested(resource_ids)
-    if settings.freeze:
+    if is_frozen(settings):
         return _finish(settings, receipt, [_skipped(rid, FROZEN_DETAIL) for rid in requested])
 
     ids = list(resource_ids) if isinstance(resource_ids, (list, tuple)) else resource_ids
@@ -327,27 +364,54 @@ def _volume_cost(volume: dict, settings: Settings) -> float:
     )
 
 
-def _quarantine_one(clients: AwsClients, settings: Settings, plan_id: str, vol_id: str, volume: dict) -> Outcome:
+def _existing_backup(clients: AwsClients, vol_id: str, plan_id: str) -> dict | None:
+    """A backup of this volume from an earlier call for the same plan (e.g. one that ran out of time)."""
+    snaps = clients.ec2.describe_snapshots(
+        OwnerIds=["self"],
+        Filters=[
+            {"Name": f"tag:{TAG_BACKUP_OF}", "Values": [vol_id]},
+            {"Name": f"tag:{TAG_PLAN_ID}", "Values": [plan_id]},
+            {"Name": "status", "Values": ["pending", "completed"]},
+        ],
+    ).get("Snapshots") or []
+    return snaps[0] if snaps else None
+
+
+def _quarantine_one(
+    clients: AwsClients, settings: Settings, plan_id: str, vol_id: str, volume: dict, deadline: float
+) -> Outcome:
     ec2 = clients.ec2
     if volume.get("State") != "available" or volume.get("Attachments"):
         return _skipped(vol_id, f"changed since approval: volume is {volume.get('State')} / attached; kept")
-    backup_tags = _backup_tags(volume, settings, plan_id, datetime.now(timezone.utc))
-    snap = ec2.create_snapshot(
-        VolumeId=vol_id,
-        Description=f"Warden backup of {vol_id} before deletion (plan {plan_id})",
-        TagSpecifications=[{"ResourceType": "snapshot", "Tags": _to_aws_tags(backup_tags)}],
-    )
-    snap_id = snap["SnapshotId"]
+    wait_seconds = min(settings.snapshot_wait_seconds, int(deadline - _clock()))
+    if wait_seconds < MIN_SNAPSHOT_WAIT_SECONDS:
+        return _skipped(
+            vol_id,
+            "not started: this call's time budget is used up (MCP requests time out); volume kept - "
+            "call quarantine_volumes again with this id",
+        )
+    existing = _existing_backup(clients, vol_id, plan_id)
+    if existing:
+        snap_id = existing["SnapshotId"]
+        expires = policy.tags_to_dict(existing.get("Tags")).get(TAG_EXPIRES_AT, "?")
+    else:
+        backup_tags = _backup_tags(volume, settings, plan_id, datetime.now(timezone.utc))
+        snap = ec2.create_snapshot(
+            VolumeId=vol_id,
+            Description=f"Warden backup of {vol_id} before deletion (plan {plan_id})",
+            TagSpecifications=[{"ResourceType": "snapshot", "Tags": _to_aws_tags(backup_tags)}],
+        )
+        snap_id, expires = snap["SnapshotId"], backup_tags[TAG_EXPIRES_AT]
     try:
-        ec2.get_waiter("snapshot_completed").wait(
-            SnapshotIds=[snap_id],
-            WaiterConfig={"Delay": 5, "MaxAttempts": max(1, settings.snapshot_wait_seconds // 5)},
+        wait_for(
+            ec2, "snapshot_completed", delay=5, max_attempts=max(1, wait_seconds // 5),
+            sleep=lambda s: _sleep(s), SnapshotIds=[snap_id],
         )
     except WaiterError as err:
         return _skipped(
             vol_id,
-            f"backup not complete; volume kept (snapshot {snap_id} still pending after "
-            f"{settings.snapshot_wait_seconds}s: {err})",
+            f"backup not complete; volume kept (snapshot {snap_id} still pending after {wait_seconds}s: {err}). "
+            "Call quarantine_volumes again with this id later; it reuses this backup",
             backup_snapshot_id=snap_id,
         )
     latest = _describe_volume(clients, vol_id)
@@ -360,39 +424,65 @@ def _quarantine_one(clients: AwsClients, settings: Settings, plan_id: str, vol_i
         ec2.delete_volume(VolumeId=vol_id)
     except ClientError as err:
         return _failed(vol_id, f"backup {snap_id} completed but delete failed: {error_code(err)}", backup_snapshot_id=snap_id)
-    after = _describe_volume(clients, vol_id)
-    if after is not None and after.get("State") not in ("deleting", "deleted"):
-        return _failed(
-            vol_id, f"delete issued but volume is still {after.get('State')}", undo=undo, backup_snapshot_id=snap_id
-        )
-    detail = f"backed up to {snap_id} (completed) then deleted; restorable until {backup_tags[TAG_EXPIRES_AT]}"
+
+    def gone() -> bool:
+        after = _describe_volume(clients, vol_id)
+        return after is None or after.get("State") in ("deleting", "deleted")
+
+    detail = f"backed up to {snap_id} (completed) then deleted; restorable until {expires}"
+    if not _settle(gone):
+        detail += "; AWS accepted the delete but still listed the volume a few seconds later (re-check shortly)"
     return _result(vol_id, "done", detail, undo=undo, backup_snapshot_id=snap_id), _volume_cost(volume, settings)
 
 
 def quarantine_volumes(clients: AwsClients, settings: Settings, plan_id: str, volume_ids: list[str]) -> dict:
-    """Back up each approved unused volume to a completed snapshot, then delete it. Reversible."""
-    return _run_gated(clients, settings, "quarantine_volume", plan_id, volume_ids, _quarantine_one)
+    """Back up each approved unused volume to a completed snapshot, then delete it. Reversible.
+
+    All snapshot waits in one call share CALL_BUDGET_SECONDS, so the call answers before the MCP client
+    times out; items that do not fit are kept and can be retried (a pending backup is reused).
+    """
+    deadline = _clock() + CALL_BUDGET_SECONDS
+
+    def actor(c: AwsClients, s: Settings, pid: str, vid: str, vol: dict) -> Outcome:
+        return _quarantine_one(c, s, pid, vid, vol, deadline)
+
+    return _run_gated(clients, settings, "quarantine_volume", plan_id, volume_ids, actor)
 
 
 # ---------------------------------------------------------------- snapshots
 
 
-def _recycle_bin_ready(clients: AwsClients) -> bool:
-    """Scanner owns the rule check; import lazily so this module stays import-safe."""
+def _recycle_rules(clients: AwsClients) -> list[dict]:
+    """Recycle Bin rules that keep warden:recycle=true snapshots. Scanner owns the rule check."""
     try:
-        from .scanner import recycle_bin_ready
+        from .scanner import recycle_rules
     except ImportError:
-        return False
+        return []
     try:
-        return bool(recycle_bin_ready(clients))
+        return list(recycle_rules(clients))
     except Exception:  # noqa: BLE001
-        return False
+        return []
+
+
+def _rules_keep(rules: list[dict], snap: dict) -> bool:
+    """True if one of the rules would keep this particular snapshot (its own tags can exclude it)."""
+    from .scanner import rule_covers
+
+    tags = policy.tags_to_dict(snap.get("Tags"))
+    return any(rule_covers(rule, tags) for rule in rules)
 
 
 def _in_recycle_bin(clients: AwsClients, snapshot_id: str) -> bool:
     """True/False from the Recycle Bin listing; raises if the API is unavailable."""
     resp = clients.ec2.list_snapshots_in_recycle_bin(SnapshotIds=[snapshot_id])
     return any(s.get("SnapshotId") == snapshot_id for s in resp.get("Snapshots") or [])
+
+
+def _untag_recycle(ec2: Any, snap_id: str) -> None:
+    try:
+        ec2.delete_tags(Resources=[snap_id], Tags=[{"Key": TAG_RECYCLE}, {"Key": TAG_RECYCLED_AT}, {"Key": TAG_PLAN_ID}])
+    except ClientError:
+        pass
 
 
 def _recycle_one(clients: AwsClients, settings: Settings, plan_id: str, snap_id: str, snap: dict) -> Outcome:
@@ -405,35 +495,63 @@ def _recycle_one(clients: AwsClients, settings: Settings, plan_id: str, snap_id:
             {"Key": TAG_PLAN_ID, "Value": plan_id},
         ],
     )
+
+    def tag_visible() -> bool:
+        current = _describe_snapshot(clients, snap_id)
+        return bool(current) and policy.tags_to_dict(current.get("Tags")).get(TAG_RECYCLE) == TAG_RECYCLE_VALUE
+
+    # The Recycle Bin rule matches the tags AWS sees at delete time; never delete before the tag is visible.
+    if not _settle(tag_visible):
+        _untag_recycle(ec2, snap_id)
+        return _failed(
+            snap_id, f"{TAG_RECYCLE} tag not visible yet, so the Recycle Bin rule might not keep it; "
+            "snapshot kept (not deleted) - try again"
+        )
     try:
         ec2.delete_snapshot(SnapshotId=snap_id)
     except ClientError as err:
-        try:
-            ec2.delete_tags(Resources=[snap_id], Tags=[{"Key": TAG_RECYCLE}, {"Key": TAG_RECYCLED_AT}, {"Key": TAG_PLAN_ID}])
-        except ClientError:
-            pass
+        _untag_recycle(ec2, snap_id)
         return _failed(snap_id, f"delete failed (snapshot kept): {error_code(err)}")
     saved = pricing.snapshot_monthly_usd(int(snap.get("VolumeSize") or 0), region=settings.region)
     undo = {"tool": "restore_snapshot", "args": {"snapshot_id": snap_id}}
     try:
-        found = _in_recycle_bin(clients, snap_id)
+        found = _settle(lambda: _in_recycle_bin(clients, snap_id), RBIN_ATTEMPTS, RBIN_DELAY_SECONDS)
     except Exception as err:  # noqa: BLE001 - API may be unavailable (permissions, emulators)
-        detail = f"moved to Recycle Bin; verification unavailable ({error_code(err)})"
+        detail = (
+            f"deleted; Recycle Bin verification unavailable ({error_code(err)}) - undo via restore_snapshot "
+            "is NOT guaranteed"
+        )
         return _result(snap_id, "done", detail, undo=undo), saved
     if not found:
-        return _failed(snap_id, "deleted but NOT found in Recycle Bin - may be unrecoverable; check rbin rules")
+        waited = int((RBIN_ATTEMPTS - 1) * RBIN_DELAY_SECONDS)
+        return _failed(
+            snap_id,
+            f"deleted but NOT found in the Recycle Bin after ~{waited}s - may be unrecoverable; check rbin rules "
+            "(restore_snapshot re-checks the bin)",
+            undo=undo,
+        )
     return _result(snap_id, "done", "moved to Recycle Bin (verified); restorable via restore_snapshot", undo=undo), saved
 
 
 def recycle_snapshots(clients: AwsClients, settings: Settings, plan_id: str, snapshot_ids: list[str]) -> dict:
     """Tag and delete snapshots into the Recycle Bin (retention rule required). Reversible."""
+    rules: list[dict] = []
 
     def preflight() -> str | None:
-        if _recycle_bin_ready(clients):
+        rules.extend(_recycle_rules(clients))
+        if rules:
             return None
         return "Recycle Bin rule missing - use delete_snapshot_permanently after explicit approval"
 
-    return _run_gated(clients, settings, "recycle_snapshot", plan_id, snapshot_ids, _recycle_one, preflight)
+    def actor(c: AwsClients, s: Settings, pid: str, sid: str, snap: dict) -> Outcome:
+        if not _rules_keep(rules, snap):
+            return _skipped(
+                sid, "no Recycle Bin rule would keep this snapshot (excluded by its tags); kept - re-scan, "
+                "it will be offered as delete_snapshot (irreversible, one per approval)"
+            )
+        return _recycle_one(c, s, pid, sid, snap)
+
+    return _run_gated(clients, settings, "recycle_snapshot", plan_id, snapshot_ids, actor, preflight)
 
 
 def _delete_snapshot_one(clients: AwsClients, settings: Settings, plan_id: str, snap_id: str, snap: dict) -> Outcome:
@@ -441,10 +559,11 @@ def _delete_snapshot_one(clients: AwsClients, settings: Settings, plan_id: str, 
         clients.ec2.delete_snapshot(SnapshotId=snap_id)
     except ClientError as err:
         return _failed(snap_id, f"delete failed (snapshot kept): {error_code(err)}")
-    if _describe_snapshot(clients, snap_id) is not None:
-        return _failed(snap_id, "delete issued but snapshot still exists")
+    detail = "permanently deleted (IRREVERSIBLE; no Recycle Bin copy)"
+    if not _settle(lambda: _describe_snapshot(clients, snap_id) is None):
+        detail += "; AWS accepted the delete but still listed the snapshot a few seconds later (re-check shortly)"
     saved = pricing.snapshot_monthly_usd(int(snap.get("VolumeSize") or 0), region=settings.region)
-    return _result(snap_id, "done", "permanently deleted (IRREVERSIBLE; no Recycle Bin copy)"), saved
+    return _result(snap_id, "done", detail), saved
 
 
 def delete_snapshot_permanently(clients: AwsClients, settings: Settings, plan_id: str, snapshot_id: str) -> dict:
@@ -455,15 +574,48 @@ def delete_snapshot_permanently(clients: AwsClients, settings: Settings, plan_id
 # ---------------------------------------------------------------- instances
 
 
+def _state_from(resp: dict, key: str, inst_id: str) -> str | None:
+    """CurrentState.Name for inst_id from a StopInstances/StartInstances response."""
+    for change in resp.get(key) or []:
+        if change.get("InstanceId") == inst_id:
+            return (change.get("CurrentState") or {}).get("Name")
+    return None
+
+
+def _became_active(clients: AwsClients, settings: Settings, inst: dict) -> str | None:
+    """Skip reason if the instance was busy in the last few minutes (the plan may be up to an hour old)."""
+    from . import scanner
+
+    minutes = min(settings.idle_lookback_minutes, ACTIVITY_RECHECK_MINUTES)
+    try:
+        act = scanner._activity(
+            clients, inst["InstanceId"], settings, datetime.now(timezone.utc),
+            launched=inst.get("LaunchTime"), lookback_minutes=minutes,
+        )
+    except Exception as err:  # noqa: BLE001 - no fresh evidence means no stop
+        return f"could not re-check recent activity ({error_code(err)}); not stopped"
+    cpu, net = act["max_cpu_pct"], act["network_bytes_per_hour"] or 0.0
+    if cpu is not None and (cpu >= settings.idle_cpu_pct or net >= settings.idle_network_bytes_per_hour):
+        return (
+            f"changed since approval: active in the last {minutes} minutes (max CPU {cpu}%, "
+            f"{net:,.0f} network bytes/hour); not stopped"
+        )
+    return None
+
+
 def _stop_one(clients: AwsClients, settings: Settings, plan_id: str, inst_id: str, inst: dict) -> Outcome:
     if inst.get("InstanceLifecycle") == "spot":
         return _skipped(inst_id, "spot instance; not stopped")
     if inst.get("RootDeviceType") == "instance-store":
         return _skipped(inst_id, "instance-store root device (data would be lost); not stopped")
+    busy = _became_active(clients, settings, inst)
+    if busy:
+        return _skipped(inst_id, busy)
     ec2 = clients.ec2
-    ec2.stop_instances(InstanceIds=[inst_id])
-    latest = _describe_instance(clients, inst_id)
-    state = ((latest or {}).get("State") or {}).get("Name")
+    resp = ec2.stop_instances(InstanceIds=[inst_id])
+    state = _state_from(resp, "StoppingInstances", inst_id)
+    if state is None:
+        state = ((_describe_instance(clients, inst_id) or {}).get("State") or {}).get("Name")
     undo = {"tool": "start_instances", "args": {"instance_ids": [inst_id]}}
     if state not in ("stopping", "stopped"):
         return _failed(inst_id, f"stop issued but instance is {state}", undo=undo)
@@ -495,12 +647,12 @@ def _release_one(clients: AwsClients, settings: Settings, plan_id: str, alloc_id
         clients.ec2.release_address(AllocationId=alloc_id)
     except ClientError as err:
         return _failed(alloc_id, f"release failed (address kept): {error_code(err)}", public_ip=ip)
-    if _describe_address(clients, alloc_id) is not None:
-        return _failed(alloc_id, "release issued but address still allocated", public_ip=ip)
     detail = (
         f"released {ip} (IRREVERSIBLE). Recovery is only possible via allocate_address(Address='{ip}') "
         "if nobody else has taken it; update DNS records and allow-lists."
     )
+    if not _settle(lambda: _describe_address(clients, alloc_id) is None):
+        detail += " AWS accepted the release but still listed the address a few seconds later (re-check shortly)."
     return _result(alloc_id, "done", detail, public_ip=ip), pricing.address_monthly_usd(settings.region)
 
 
@@ -534,7 +686,7 @@ def _run_simple(
     clients: AwsClients, settings: Settings, action: str, ids: Any, limit: int, actor: Callable[[str], Outcome]
 ) -> dict:
     receipt = _new_receipt(clients, settings, action, None)
-    if settings.freeze:
+    if is_frozen(settings):
         return _finish(settings, receipt, [_skipped(rid, FROZEN_DETAIL) for rid in _requested(ids)])
     clean, problem = _check_ids(ids, limit)
     if problem:
@@ -550,6 +702,8 @@ def _restore_volume_one(clients: AwsClients, settings: Settings, snap_id: str) -
     source = tags.get(TAG_BACKUP_OF)
     if not source:
         return _skipped(snap_id, f"not a Warden backup (no {TAG_BACKUP_OF} tag); refusing to restore")
+    if not policy.in_scope(tags, settings):
+        return _skipped(snap_id, f"backup is not in scope ({settings.scope_label}); refusing to restore")
     if snap.get("State") != "completed":
         return _skipped(snap_id, f"backup snapshot is {snap.get('State')}, not completed")
     az = tags.get(TAG_RESTORE_AZ)
@@ -569,11 +723,9 @@ def _restore_volume_one(clients: AwsClients, settings: Settings, snap_id: str) -
     original = {k: v for k, v in policy.copyable_tags(tags).items() if k not in BOOKKEEPING_TAGS}
     original[TAG_RESTORED_FROM] = snap_id
     kwargs["TagSpecifications"] = [{"ResourceType": "volume", "Tags": _to_aws_tags(original)}]
-    new_vol = clients.ec2.create_volume(**kwargs)["VolumeId"]
-    check = _describe_volume(clients, new_vol)
-    if check is None:
-        return _failed(snap_id, f"create_volume returned {new_vol} but it cannot be described")
-    detail = f"restored {source} as {new_vol} in {az} ({vtype}, state {check.get('State')}); attach it where needed"
+    created = clients.ec2.create_volume(**kwargs)  # its response is authoritative; describe may lag
+    new_vol = created["VolumeId"]
+    detail = f"restored {source} as {new_vol} in {az} ({vtype}, state {created.get('State')}); attach it where needed"
     return _result(snap_id, "done", detail, backup_snapshot_id=snap_id), 0.0
 
 
@@ -586,15 +738,12 @@ def restore_volume(clients: AwsClients, settings: Settings, backup_snapshot_id: 
 
 
 def _recycled_by_warden(settings: Settings, snapshot_id: str) -> bool:
-    """True if a Warden receipt shows this snapshot was recycled successfully."""
-    for summary in audit_mod.list_receipts(settings, limit=100_000):
-        if summary.get("action") != "recycle_snapshot":
-            continue
-        receipt = audit_mod.load_receipt(settings, str(summary.get("receipt_id"))) or {}
-        for r in receipt.get("results") or []:
-            if r.get("resource_id") == snapshot_id and r.get("status") == "done":
-                return True
-    return False
+    """True if a Warden receipt shows Warden deleted this snapshot for recycling (its result carries the
+    restore_snapshot undo, even when the Recycle Bin copy was not yet visible). The live bin decides the rest."""
+    return any(
+        (r.get("undo") or {}).get("tool") == "restore_snapshot"
+        for _, r in _warden_results(settings, "recycle_snapshot", snapshot_id)
+    )
 
 
 def _restore_snapshot_one(clients: AwsClients, settings: Settings, snap_id: str) -> Outcome:
@@ -632,12 +781,21 @@ def _start_one(clients: AwsClients, settings: Settings, inst_id: str) -> Outcome
     tags = policy.tags_to_dict(inst.get("Tags"))
     if TAG_STOPPED_AT not in tags:
         return _skipped(inst_id, f"not stopped by Warden (no {TAG_STOPPED_AT} tag); refusing to start")
+    if not policy.in_scope(tags, settings):
+        return _skipped(inst_id, f"not in scope ({settings.scope_label}); refusing to start")
+    stops = [receipt for receipt, r in _warden_results(settings, "stop_instance", inst_id) if r.get("status") == "done"]
+    if not stops:
+        return _skipped(inst_id, "not stopped by Warden (no matching stop receipt); refusing to start")
+    plan_tag = tags.get(TAG_PLAN_ID)
+    if plan_tag and plan_tag not in {receipt.get("plan_id") for receipt in stops}:
+        return _skipped(inst_id, f"{TAG_PLAN_ID}={plan_tag} matches no Warden stop receipt; refusing to start")
     state = (inst.get("State") or {}).get("Name")
     if state != "stopped":
         return _skipped(inst_id, f"instance is {state}, not stopped; try again shortly")
-    clients.ec2.start_instances(InstanceIds=[inst_id])
-    latest = _describe_instance(clients, inst_id)
-    new_state = ((latest or {}).get("State") or {}).get("Name")
+    resp = clients.ec2.start_instances(InstanceIds=[inst_id])
+    new_state = _state_from(resp, "StartingInstances", inst_id)
+    if new_state is None:
+        new_state = ((_describe_instance(clients, inst_id) or {}).get("State") or {}).get("Name")
     if new_state not in ("pending", "running"):
         return _failed(inst_id, f"start issued but instance is {new_state}")
     detail = f"started (state {new_state})"

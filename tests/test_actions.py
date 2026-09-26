@@ -59,6 +59,12 @@ def make_address(aws, tags: dict[str, str] | None = None) -> dict:
     return aws.ec2.describe_addresses(AllocationIds=[alloc["AllocationId"]])["Addresses"][0]
 
 
+WARDEN_RULE = {
+    "Status": "available",
+    "RetentionPeriod": {"RetentionPeriodValue": 7, "RetentionPeriodUnit": "DAYS"},
+    "ResourceTags": [{"ResourceTagKey": "warden:recycle", "ResourceTagValue": "true"}],
+}
+
 _ID_KEY = {"volume": "VolumeId", "snapshot": "SnapshotId", "instance": "InstanceId", "address": "AllocationId"}
 
 
@@ -106,7 +112,7 @@ def recycle_bin(aws, monkeypatch):
         binned.discard(SnapshotId)
         return {"SnapshotId": SnapshotId}
 
-    monkeypatch.setattr(actions, "_recycle_bin_ready", lambda clients: True)
+    monkeypatch.setattr(actions, "_recycle_rules", lambda clients: [WARDEN_RULE])
     monkeypatch.setattr(aws.ec2, "delete_snapshot", delete_snapshot)
     monkeypatch.setattr(aws.ec2, "list_snapshots_in_recycle_bin", list_in_bin)
     monkeypatch.setattr(aws.ec2, "restore_snapshot_from_recycle_bin", restore_from_bin)
@@ -355,7 +361,7 @@ def test_recycle_snapshot_happy_path(aws, settings, recycle_bin, monkeypatch):
 
 def test_recycle_refused_without_recycle_bin_rule(aws, settings, monkeypatch):
     snap = make_snapshot(aws)
-    monkeypatch.setattr(actions, "_recycle_bin_ready", lambda clients: False)
+    monkeypatch.setattr(actions, "_recycle_rules", lambda clients: [])
     pid = make_plan(aws, settings, [("snapshot", "recycle_snapshot", snap)])
     receipt = actions.recycle_snapshots(aws, settings, pid, [snap["SnapshotId"]])
     assert statuses(receipt) == ["skipped"]
@@ -365,7 +371,7 @@ def test_recycle_refused_without_recycle_bin_rule(aws, settings, monkeypatch):
 
 def test_recycle_verification_unavailable_degrades(aws, settings, monkeypatch):
     snap = make_snapshot(aws)
-    monkeypatch.setattr(actions, "_recycle_bin_ready", lambda clients: True)
+    monkeypatch.setattr(actions, "_recycle_rules", lambda clients: [WARDEN_RULE])
     pid = make_plan(aws, settings, [("snapshot", "recycle_snapshot", snap)])
     receipt = actions.recycle_snapshots(aws, settings, pid, [snap["SnapshotId"]])
     assert statuses(receipt) == ["done"]
@@ -506,3 +512,360 @@ def test_per_item_aws_error_becomes_failed(aws, settings, monkeypatch):
     receipt = actions.stop_instances(aws, settings, pid, [inst["InstanceId"]])
     assert statuses(receipt) == ["failed"]
     assert "UnauthorizedOperation" in receipt["results"][0]["detail"]
+
+
+# ---------------------------------------------------------------- review fixes
+
+
+@pytest.fixture(autouse=True)
+def no_sleep(monkeypatch):
+    """Retry/settle loops must not slow the suite down."""
+    monkeypatch.setattr(actions, "_sleep", lambda seconds: None)
+
+
+def _client_error(code: str, op: str = "Op"):
+    from botocore.exceptions import ClientError
+
+    return ClientError({"Error": {"Code": code, "Message": code}}, op)
+
+
+def test_quarantine_total_wait_fits_mcp_timeout(aws, settings, monkeypatch):  # S1 / F2
+    vols = [make_volume(aws), make_volume(aws)]
+    pid = make_plan(aws, settings, [("volume", "quarantine_volume", v) for v in vols])
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(actions, "_clock", lambda: clock["t"])
+    configured: list[int] = []
+
+    class SlowButDone:
+        def wait(self, WaiterConfig, **_):
+            configured.append(WaiterConfig["Delay"] * WaiterConfig["MaxAttempts"])
+            clock["t"] += actions.CALL_BUDGET_SECONDS - 5  # the first snapshot eats the budget
+
+    monkeypatch.setattr(aws.ec2, "get_waiter", lambda name: SlowButDone())
+    receipt = actions.quarantine_volumes(aws, settings, pid, [v["VolumeId"] for v in vols])
+
+    assert statuses(receipt) == ["done", "skipped"], receipt
+    assert sum(configured) <= actions.CALL_BUDGET_SECONDS < 240
+    assert "time budget" in receipt["results"][1]["detail"]
+    assert aws.ec2.describe_volumes(VolumeIds=[vols[1]["VolumeId"]])["Volumes"]
+    backups = aws.ec2.describe_snapshots(Filters=[{"Name": f"tag:{TAG_BACKUP_OF}", "Values": [vols[1]["VolumeId"]]}])
+    assert backups["Snapshots"] == []  # nothing started for the item that did not fit
+
+
+def test_quarantine_rerun_reuses_pending_backup(aws, settings, monkeypatch):  # S1: picked up on a re-run
+    vol = make_volume(aws)
+    vid = vol["VolumeId"]
+    pid = make_plan(aws, settings, [("volume", "quarantine_volume", vol)])
+
+    class Pending:
+        def wait(self, **_):
+            raise WaiterError(name="SnapshotCompleted", reason="Max attempts exceeded", last_response={})
+
+    monkeypatch.setattr(aws.ec2, "get_waiter", lambda name: Pending())
+    first = actions.quarantine_volumes(aws, settings, pid, [vid])
+    assert statuses(first) == ["skipped"]
+    monkeypatch.undo()
+    monkeypatch.setattr(actions, "_sleep", lambda seconds: None)
+    second = actions.quarantine_volumes(aws, settings, pid, [vid])
+    assert statuses(second) == ["done"], second
+    assert second["results"][0]["backup_snapshot_id"] == first["results"][0]["backup_snapshot_id"]
+
+
+def test_wait_retries_not_found_right_after_create():  # RA-2
+    from warden.aws import wait_for
+
+    calls: list[dict] = []
+
+    class Waiter:
+        def wait(self, **kw):
+            calls.append(kw)
+            if len(calls) == 1:
+                raise WaiterError(
+                    name="SnapshotCompleted", reason="An error occurred (InvalidSnapshot.NotFound)",
+                    last_response={"Error": {"Code": "InvalidSnapshot.NotFound"}},
+                )
+
+    class Client:
+        def get_waiter(self, name):
+            assert name == "snapshot_completed"
+            return Waiter()
+
+    wait_for(Client(), "snapshot_completed", delay=5, max_attempts=10, sleep=lambda s: None, SnapshotIds=["snap-1"])
+    assert len(calls) == 2 and calls[1]["SnapshotIds"] == ["snap-1"]
+    assert calls[1]["WaiterConfig"]["MaxAttempts"] == 9
+
+
+def test_wait_does_not_retry_other_errors():  # RA-2
+    from warden.aws import wait_for
+
+    class Waiter:
+        def wait(self, **kw):
+            raise WaiterError(name="VolumeAvailable", reason="terminal", last_response={"Volumes": []})
+
+    class Client:
+        def get_waiter(self, name):
+            return Waiter()
+
+    with pytest.raises(WaiterError):
+        wait_for(Client(), "volume_available", delay=5, max_attempts=10, sleep=lambda s: None, VolumeIds=["v"])
+
+
+def test_recycle_waits_for_tag_before_deleting(aws, settings, recycle_bin, monkeypatch):  # F3 / RA-4
+    snap = make_snapshot(aws)
+    sid = snap["SnapshotId"]
+    pid = make_plan(aws, settings, [("snapshot", "recycle_snapshot", snap)])
+    real_describe = aws.ec2.describe_snapshots
+    real_delete = aws.ec2.delete_snapshot
+    seen = {"n": 0, "tag_visible_before_delete": False}
+
+    def lagging_describe(**kw):  # right after tagging, the first read does not show the tag yet
+        out = real_describe(**kw)
+        seen["n"] += 1
+        if seen["n"] == 2:
+            for s in out["Snapshots"]:
+                s["Tags"] = [t for t in s.get("Tags", []) if t["Key"] != TAG_RECYCLE]
+        return out
+
+    def delete(**kw):
+        seen["tag_visible_before_delete"] = seen["n"] >= 3
+        return real_delete(**kw)
+
+    monkeypatch.setattr(aws.ec2, "describe_snapshots", lagging_describe)
+    monkeypatch.setattr(aws.ec2, "delete_snapshot", delete)
+    receipt = actions.recycle_snapshots(aws, settings, pid, [sid])
+    assert statuses(receipt) == ["done"], receipt
+    assert seen["tag_visible_before_delete"]
+
+
+def test_recycle_keeps_snapshot_when_tag_never_visible(aws, settings, recycle_bin, monkeypatch):  # F3
+    snap = make_snapshot(aws)
+    sid = snap["SnapshotId"]
+    pid = make_plan(aws, settings, [("snapshot", "recycle_snapshot", snap)])
+    real_describe = aws.ec2.describe_snapshots
+    calls = {"n": 0}
+
+    def never_tagged(**kw):
+        out = real_describe(**kw)
+        calls["n"] += 1
+        if calls["n"] > 1:  # the first read is the pre-action re-check
+            for s in out["Snapshots"]:
+                s["Tags"] = [t for t in s.get("Tags", []) if t["Key"] != TAG_RECYCLE]
+        return out
+
+    monkeypatch.setattr(aws.ec2, "describe_snapshots", never_tagged)
+    receipt = actions.recycle_snapshots(aws, settings, pid, [sid])
+    assert statuses(receipt) == ["failed"]
+    assert "not deleted" in receipt["results"][0]["detail"]
+    assert sid not in recycle_bin
+    assert real_describe(SnapshotIds=[sid])["Snapshots"]
+
+
+def test_recycle_bin_listing_lag_is_retried(aws, settings, recycle_bin, monkeypatch):  # S4 / RA-4 / F3
+    snap = make_snapshot(aws)
+    sid = snap["SnapshotId"]
+    pid = make_plan(aws, settings, [("snapshot", "recycle_snapshot", snap)])
+    real_list = aws.ec2.list_snapshots_in_recycle_bin
+    polls = {"n": 0}
+
+    def lagging(**kw):
+        polls["n"] += 1
+        return {"Snapshots": []} if polls["n"] < 3 else real_list(**kw)
+
+    monkeypatch.setattr(aws.ec2, "list_snapshots_in_recycle_bin", lagging)
+    receipt = actions.recycle_snapshots(aws, settings, pid, [sid])
+    assert statuses(receipt) == ["done"], receipt
+    assert "verified" in receipt["results"][0]["detail"]
+
+
+def test_recycle_verification_error_never_claims_recycle_bin(aws, settings, recycle_bin, monkeypatch):  # S4
+    snap = make_snapshot(aws)
+    sid = snap["SnapshotId"]
+    pid = make_plan(aws, settings, [("snapshot", "recycle_snapshot", snap)])
+
+    def boom(**_):
+        raise _client_error("InvalidSnapshot.NotFound", "ListSnapshotsInRecycleBin")
+
+    monkeypatch.setattr(aws.ec2, "list_snapshots_in_recycle_bin", boom)
+    receipt = actions.recycle_snapshots(aws, settings, pid, [sid])
+    detail = receipt["results"][0]["detail"]
+    assert "moved to Recycle Bin" not in detail
+    assert "NOT guaranteed" in detail
+
+
+def test_restore_allowed_after_unverified_recycle(aws, settings, recycle_bin, monkeypatch):  # S4 / RA-4
+    snap = make_snapshot(aws)
+    sid = snap["SnapshotId"]
+    pid = make_plan(aws, settings, [("snapshot", "recycle_snapshot", snap)])
+    real_list = aws.ec2.list_snapshots_in_recycle_bin
+    monkeypatch.setattr(aws.ec2, "list_snapshots_in_recycle_bin", lambda **kw: {"Snapshots": []})
+    receipt = actions.recycle_snapshots(aws, settings, pid, [sid])
+    assert statuses(receipt) == ["failed"]  # not seen in the bin (yet)
+    monkeypatch.setattr(aws.ec2, "list_snapshots_in_recycle_bin", real_list)  # the bin catches up
+    restored = actions.restore_snapshot(aws, settings, sid)
+    assert statuses(restored) == ["done"], restored
+
+
+def test_recycle_skips_snapshot_excluded_by_region_rule(aws, settings, recycle_bin, monkeypatch):  # S5
+    snap = make_snapshot(aws, {"env": "dev"})
+    rule = {"Status": "available", "RetentionPeriod": {"RetentionPeriodValue": 7, "RetentionPeriodUnit": "DAYS"},
+            "ExcludeResourceTags": [{"ResourceTagKey": "env", "ResourceTagValue": "dev"}]}
+    monkeypatch.setattr(actions, "_recycle_rules", lambda clients: [rule])
+    pid = make_plan(aws, settings, [("snapshot", "recycle_snapshot", snap)])
+    receipt = actions.recycle_snapshots(aws, settings, pid, [snap["SnapshotId"]])
+    assert statuses(receipt) == ["skipped"]
+    assert snap["SnapshotId"] not in recycle_bin
+    assert aws.ec2.describe_snapshots(SnapshotIds=[snap["SnapshotId"]])["Snapshots"]
+
+
+def test_start_refuses_tagged_instance_without_warden_receipt(aws, settings):  # S7
+    inst = make_instance(aws, {TAG_STOPPED_AT: "2026-01-01T00:00:00Z"})
+    iid = inst["InstanceId"]
+    aws.ec2.stop_instances(InstanceIds=[iid])
+    receipt = actions.start_instances(aws, settings, [iid])
+    assert statuses(receipt) == ["skipped"]
+    assert "receipt" in receipt["results"][0]["detail"]
+
+
+def test_start_refuses_out_of_scope_instance(aws, settings):  # S7
+    inst = make_instance(aws, {"Name": "x"})
+    iid = inst["InstanceId"]
+    pid = make_plan(aws, settings, [("instance", "stop_instance", inst)])
+    assert statuses(actions.stop_instances(aws, settings, pid, [iid])) == ["done"]
+    scoped = dataclasses.replace(settings, scope_tag_key="warden:demo", scope_tag_value="true")
+    receipt = actions.start_instances(aws, scoped, [iid])
+    assert statuses(receipt) == ["skipped"]
+    assert "scope" in receipt["results"][0]["detail"]
+
+
+def test_restore_volume_refuses_out_of_scope_backup(aws, settings):  # S7
+    vol = make_volume(aws, {"Name": "x"})
+    pid = make_plan(aws, settings, [("volume", "quarantine_volume", vol)])
+    snap_id = actions.quarantine_volumes(aws, settings, pid, [vol["VolumeId"]])["results"][0]["backup_snapshot_id"]
+    scoped = dataclasses.replace(settings, scope_tag_key="warden:demo", scope_tag_value="true")
+    receipt = actions.restore_volume(aws, scoped, snap_id)
+    assert statuses(receipt) == ["skipped"]
+    assert "scope" in receipt["results"][0]["detail"]
+
+
+def test_stop_rechecks_activity_before_stopping(aws, settings, monkeypatch):  # S8
+    from warden import scanner
+
+    inst = make_instance(aws)
+    iid = inst["InstanceId"]
+    pid = make_plan(aws, settings, [("instance", "stop_instance", inst)])
+    monkeypatch.setattr(scanner, "BOOT_WARMUP_MINUTES", -60)  # moto launched it just now
+
+    def busy(**kw):
+        stat = kw["Statistics"][0]
+        return {"Datapoints": [{stat: 90.0 if kw["MetricName"] == "CPUUtilization" else 10.0}]}
+
+    monkeypatch.setattr(aws.cloudwatch, "get_metric_statistics", busy)
+    receipt = actions.stop_instances(aws, settings, pid, [iid])
+    assert statuses(receipt) == ["skipped"]
+    assert "active" in receipt["results"][0]["detail"]
+    desc = aws.ec2.describe_instances(InstanceIds=[iid])["Reservations"][0]["Instances"][0]
+    assert desc["State"]["Name"] == "running"
+
+
+def test_freeze_file_blocks_without_restart(aws, settings):  # S14
+    vol = make_volume(aws)
+    pid = make_plan(aws, settings, [("volume", "quarantine_volume", vol)])
+    settings.state_dir.mkdir(parents=True, exist_ok=True)
+    (settings.state_dir / "FREEZE").write_text("", encoding="utf-8")
+    receipt = actions.quarantine_volumes(aws, settings, pid, [vol["VolumeId"]])
+    assert statuses(receipt) == ["skipped"] and receipt["freeze"] is True
+    assert statuses(actions.start_instances(aws, settings, ["i-12345678"])) == ["skipped"]
+    assert aws.ec2.describe_volumes(VolumeIds=[vol["VolumeId"]])["Volumes"]
+
+
+def test_release_is_done_even_if_describe_lags(aws, settings, monkeypatch):  # RA-3 (a)
+    addr = make_address(aws)
+    aid = addr["AllocationId"]
+    pid = make_plan(aws, settings, [("address", "release_address", addr)])
+    real_describe = aws.ec2.describe_addresses
+    real_release = aws.ec2.release_address
+    stale = {"on": False}
+
+    def release(**kw):
+        out = real_release(**kw)
+        stale["on"] = True
+        return out
+
+    monkeypatch.setattr(aws.ec2, "release_address", release)
+    monkeypatch.setattr(aws.ec2, "describe_addresses",
+                        lambda **kw: {"Addresses": [addr]} if stale["on"] else real_describe(**kw))
+    receipt = actions.release_address(aws, settings, pid, aid)
+    assert statuses(receipt) == ["done"], receipt
+    assert "IRREVERSIBLE" in receipt["results"][0]["detail"]
+
+
+def test_delete_snapshot_is_done_even_if_describe_lags(aws, settings, monkeypatch):  # RA-3 (b)
+    snap = make_snapshot(aws)
+    sid = snap["SnapshotId"]
+    pid = make_plan(aws, settings, [("snapshot", "delete_snapshot", snap)])
+    real_describe = aws.ec2.describe_snapshots
+    real_delete = aws.ec2.delete_snapshot
+    stale = {"on": False}
+
+    def delete(**kw):
+        out = real_delete(**kw)
+        stale["on"] = True
+        return out
+
+    monkeypatch.setattr(aws.ec2, "delete_snapshot", delete)
+    monkeypatch.setattr(aws.ec2, "describe_snapshots",
+                        lambda **kw: {"Snapshots": [snap]} if stale["on"] else real_describe(**kw))
+    receipt = actions.delete_snapshot_permanently(aws, settings, pid, sid)
+    assert statuses(receipt) == ["done"], receipt
+
+
+def test_stop_and_start_trust_the_api_response(aws, settings, monkeypatch):  # RA-3 (c, d)
+    inst = make_instance(aws)
+    iid = inst["InstanceId"]
+    pid = make_plan(aws, settings, [("instance", "stop_instance", inst)])
+    real_describe = aws.ec2.describe_instances
+    stale_view = {"state": None}
+
+    def stale_describe(**kw):
+        out = real_describe(**kw)
+        if stale_view["state"]:
+            for r in out["Reservations"]:
+                for i in r["Instances"]:
+                    i["State"] = {"Name": stale_view["state"], "Code": 0}
+        return out
+
+    real_stop = aws.ec2.stop_instances
+
+    def stop(**kw):
+        out = real_stop(**kw)
+        stale_view["state"] = "running"  # stale read right after the stop
+        return out
+
+    monkeypatch.setattr(aws.ec2, "describe_instances", stale_describe)
+    monkeypatch.setattr(aws.ec2, "stop_instances", stop)
+    assert statuses(actions.stop_instances(aws, settings, pid, [iid])) == ["done"]
+
+    stale_view["state"] = None
+    real_start = aws.ec2.start_instances
+
+    def start(**kw):
+        out = real_start(**kw)
+        stale_view["state"] = "stopped"  # stale read right after the start
+        return out
+
+    monkeypatch.setattr(aws.ec2, "start_instances", start)
+    started = actions.start_instances(aws, settings, [iid])
+    assert statuses(started) == ["done"], started
+
+
+def test_restore_volume_done_even_if_new_volume_not_yet_describable(aws, settings, monkeypatch):  # RA-3 (e)
+    vol = make_volume(aws)
+    pid = make_plan(aws, settings, [("volume", "quarantine_volume", vol)])
+    snap_id = actions.quarantine_volumes(aws, settings, pid, [vol["VolumeId"]])["results"][0]["backup_snapshot_id"]
+
+    def not_yet(**_):
+        raise _client_error("InvalidVolume.NotFound", "DescribeVolumes")
+
+    monkeypatch.setattr(aws.ec2, "describe_volumes", not_yet)
+    receipt = actions.restore_volume(aws, settings, snap_id)
+    assert statuses(receipt) == ["done"], receipt

@@ -8,6 +8,7 @@ Run: uv run python scripts/reset.py            # prints what it WOULD delete
 from __future__ import annotations
 
 import argparse
+import time
 from typing import Any, Callable
 
 import _common  # noqa: F401  (sets up sys.path if needed)
@@ -102,6 +103,20 @@ class Resetter:
             self.out(f"  FAILED    {label}: {error_code(err)}: {str(err)[:160]}")
             return False
 
+    def _do_retry(self, label: str, fn: Callable[[], Any], retry_code: str, attempts: int = 5) -> bool:
+        """_do, but retry while AWS still reports retry_code (e.g. a just-deregistered AMI's snapshot)."""
+        for _ in range(attempts - 1):
+            try:
+                fn()
+                self.out(f"  deleted   {label}")
+                return True
+            except Exception as err:
+                if error_code(err) != retry_code:
+                    self.out(f"  FAILED    {label}: {error_code(err)}: {str(err)[:160]}")
+                    return False
+                time.sleep(self.delay)
+        return self._do(label, fn)
+
     def run(self, found: dict[str, list[dict]]) -> None:
         ids = [i["id"] for i in found["instances"]]
         if ids:
@@ -126,8 +141,9 @@ class Resetter:
             self._do(f"volume {vol['id']} {vol['name']}",
                      lambda vol=vol: self.ec2.delete_volume(VolumeId=vol["id"]))
         for snap in found["snapshots"]:
-            self._do(f"snapshot {snap['id']} {snap['name']}",
-                     lambda snap=snap: self.ec2.delete_snapshot(SnapshotId=snap["id"]))
+            self._do_retry(f"snapshot {snap['id']} {snap['name']}",
+                           lambda snap=snap: self.ec2.delete_snapshot(SnapshotId=snap["id"]),
+                           retry_code="InvalidSnapshot.InUse")
         for addr in found["addresses"]:
             if addr["association_id"]:
                 self.out(f"  skipped   Elastic IP {addr['public_ip']}: associated ({addr['association_id']})")

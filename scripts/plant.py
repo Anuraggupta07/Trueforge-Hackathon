@@ -18,7 +18,7 @@ from _common import (
     run_main,
 )
 from warden import pricing
-from warden.aws import error_code
+from warden.aws import error_code, wait_for
 from warden.config import DEMO_TAG, TAG_RECYCLE, TAG_RECYCLE_VALUE, Settings, load_settings
 
 OLD_DATA = "warden-demo-old-data"
@@ -44,6 +44,7 @@ sleep 2
 kill -STOP "$STUCK_PID"
 """
 
+INSTANCE_TYPE = "t3.micro"
 LIVE_VOLUME_STATES = ["creating", "available", "in-use"]
 LIVE_INSTANCE_STATES = ["pending", "running", "stopping", "stopped"]
 
@@ -65,7 +66,7 @@ class Planter:
 
     # ----- lookups -----------------------------------------------------------
     def _wait(self, name: str, **kwargs: Any) -> None:
-        self.ec2.get_waiter(name).wait(WaiterConfig={"Delay": self.delay, "MaxAttempts": 120}, **kwargs)
+        wait_for(self.ec2, name, delay=self.delay, max_attempts=120, **kwargs)
 
     def _find_volume(self, name: str) -> dict | None:
         vols = self.ec2.describe_volumes(Filters=[
@@ -148,7 +149,7 @@ class Planter:
                 VersionDescription="reports worker (data disk survives termination)",
                 LaunchTemplateData={
                     "ImageId": self.ami,
-                    "InstanceType": "t3.micro",
+                    "InstanceType": INSTANCE_TYPE,
                     "BlockDeviceMappings": [{
                         "DeviceName": "/dev/sdf",
                         "Ebs": {"VolumeSize": 200, "VolumeType": "gp3", "DeleteOnTermination": False},
@@ -225,7 +226,7 @@ class Planter:
             self._log(item, "skip", f"{IDLE_SERVER} already exists ({found['InstanceId']})")
         else:
             run = self.ec2.run_instances(
-                ImageId=self.ami, InstanceType="t3.micro", MinCount=1, MaxCount=1,
+                ImageId=self.ami, InstanceType=INSTANCE_TYPE, MinCount=1, MaxCount=1,
                 SubnetId=self.subnet["SubnetId"], UserData=IDLE_USER_DATA,
                 TagSpecifications=[{"ResourceType": "instance", "Tags": demo_tags(IDLE_SERVER)}],
             )
@@ -303,9 +304,10 @@ class Planter:
     # ----- orchestration -----------------------------------------------------
     def run(self) -> float:
         """Plant everything; returns the estimated monthly waste Warden can clean up."""
-        self.subnet = default_subnet(self.clients)
+        self.subnet = default_subnet(self.clients, INSTANCE_TYPE)
         if self.subnet is None:
-            raise SystemExit("No default VPC/subnet in this region - run scripts/preflight.py")
+            raise SystemExit(f"No default VPC/subnet in an AZ offering {INSTANCE_TYPE} in this region "
+                             "- run scripts/preflight.py")
         self.az = self.subnet["AvailabilityZone"]
         self.ami, source = resolve_al2023_ami(self.clients)
         if not self.ami:
@@ -340,8 +342,10 @@ class Planter:
         self.out(f"Estimated monthly waste Warden should clean up: ${cleanable:,.2f}/month "
                  f"({pricing.PRICING_NOTE}; snapshot figures are upper bounds)")
         self.out(f"All planted demo resources (incl. ones Warden must keep): ${total:,.2f}/month")
-        self.out("Reminder: CloudWatch data for the idle server needs ~10 minutes; "
-                 "CloudTrail events can take up to 15 minutes to appear.")
+        self.out("Reminder: plant at least ~25 minutes before the demo scan. Warden ignores the idle server's "
+                 "first 10 minutes (boot activity) and then needs CloudWatch data (5-minute periods, a few "
+                 "minutes' delay); scanned earlier, it shows as 'review'. CloudTrail events can take up to "
+                 "15 minutes to appear.")
         self.out("Clean up afterwards with: uv run python scripts/reset.py --yes")
         return cleanable
 

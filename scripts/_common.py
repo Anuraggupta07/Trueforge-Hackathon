@@ -12,8 +12,9 @@ except ImportError:  # pragma: no cover - only when run outside the venv
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from warden.aws import _BOTO_CONFIG, AwsClients  # noqa: E402
-from warden.config import DEMO_TAG, TAG_RECYCLE, TAG_RECYCLE_VALUE  # noqa: E402
+from warden.config import DEMO_TAG  # noqa: E402
 from warden.policy import tags_to_dict  # noqa: E402
+from warden.scanner import rule_covers  # noqa: E402
 
 AL2023_PARAM = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
 DEMO_FILTER = [{"Name": f"tag:{DEMO_TAG[0]}", "Values": [DEMO_TAG[1]]}]
@@ -37,8 +38,27 @@ def demo_tags(name: str | None = None, **extra: str) -> list[dict[str, str]]:
     return [{"Key": k, "Value": v} for k, v in tags.items()]
 
 
-def default_subnet(clients: AwsClients) -> dict | None:
-    """Default-for-AZ subnet of the default VPC in the first AZ (sorted by name), or None."""
+def _offered_azs(clients: AwsClients, instance_type: str) -> set[str] | None:
+    """AZs that offer this instance type (AZ names map to different physical AZs per account)."""
+    kwargs: dict[str, Any] = {
+        "LocationType": "availability-zone",
+        "Filters": [{"Name": "instance-type", "Values": [instance_type]}],
+    }
+    azs: set[str] = set()
+    try:
+        while True:
+            page = clients.ec2.describe_instance_type_offerings(**kwargs)
+            azs |= {o["Location"] for o in page.get("InstanceTypeOfferings", []) if o.get("Location")}
+            if not page.get("NextToken"):
+                return azs
+            kwargs["NextToken"] = page["NextToken"]
+    except Exception:  # unknown: do not filter
+        return None
+
+
+def default_subnet(clients: AwsClients, instance_type: str | None = None) -> dict | None:
+    """Default-for-AZ subnet of the default VPC in the first AZ (sorted by name) that offers
+    instance_type (when given), or None."""
     vpcs = clients.ec2.describe_vpcs(Filters=[{"Name": "isDefault", "Values": ["true"]}])["Vpcs"]
     if not vpcs:
         return None
@@ -47,6 +67,10 @@ def default_subnet(clients: AwsClients) -> dict | None:
     )["Subnets"]
     available = [s for s in subnets if s.get("State", "available") == "available"]
     preferred = [s for s in available if s.get("DefaultForAz")] or available
+    if instance_type:
+        offered = _offered_azs(clients, instance_type)
+        if offered is not None:
+            preferred = [s for s in preferred if s["AvailabilityZone"] in offered]
     return sorted(preferred, key=lambda s: s["AvailabilityZone"])[0] if preferred else None
 
 
@@ -75,18 +99,8 @@ def resolve_al2023_ami(clients: AwsClients) -> tuple[str | None, str]:
 
 
 def rule_covers_recycle_tag(rule: dict) -> bool:
-    """True if a Recycle Bin rule retains snapshots tagged warden:recycle=true."""
-    if rule.get("Status", "available") not in ("available", "enabled", None):
-        return False
-    tags = rule.get("ResourceTags") or []
-    if not tags:
-        excluded = rule.get("ExcludeResourceTags") or []
-        return not any(t.get("ResourceTagKey") == TAG_RECYCLE for t in excluded)
-    return any(
-        t.get("ResourceTagKey") == TAG_RECYCLE
-        and (t.get("ResourceTagValue") or "").lower() == TAG_RECYCLE_VALUE
-        for t in tags
-    )
+    """True if a Recycle Bin rule retains snapshots tagged warden:recycle=true (same check as the scanner)."""
+    return rule_covers(rule)
 
 
 def list_snapshot_rules(clients: AwsClients) -> list[dict]:

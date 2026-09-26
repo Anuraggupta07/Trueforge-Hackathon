@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.scripts]
-warden = "warden:main"
+warden = "warden.server:main"
 warden-server = "warden.server:main"
 
 [build-system]

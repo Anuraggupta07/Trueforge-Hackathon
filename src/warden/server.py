@@ -18,7 +18,16 @@ from mcp_types import ToolAnnotations
 
 from . import actions, audit, plan, policy, scanner
 from .aws import AwsClients, error_code
-from .config import TAG_BACKUP_OF, TAG_EXPIRES_AT, TAG_PLAN_ID, TAG_RESTORE_AZ, TAG_RESTORE_TYPE, Settings, load_settings
+from .config import (
+    TAG_BACKUP_OF,
+    TAG_EXPIRES_AT,
+    TAG_PLAN_ID,
+    TAG_RESTORE_AZ,
+    TAG_RESTORE_TYPE,
+    Settings,
+    is_frozen,
+    load_settings,
+)
 
 INSTRUCTIONS = (
     "Warden cleans up AWS cost waste safely. Always call scan_for_waste first; it returns a plan_id. "
@@ -115,7 +124,7 @@ def warden_status() -> dict[str, Any]:
             "account_id": None,
             "region": settings.region,
             "scope": settings.scope_label,
-            "freeze": settings.freeze,
+            "freeze": is_frozen(settings),
             "max_batch": settings.max_batch,
             "recycle_bin_ready": False,
             "idle_lookback_minutes": settings.idle_lookback_minutes,
@@ -124,7 +133,7 @@ def warden_status() -> dict[str, Any]:
             "backup_retention_days": settings.backup_retention_days,
             "plan_ttl_minutes": settings.plan_ttl_minutes,
             "approval_rule": APPROVAL_RULE.format(max_batch=settings.max_batch),
-            "never_does": "never terminates instances, never touches KMS keys, never deletes S3 buckets",
+            "never_does": "never terminates instances, never creates, changes or deletes KMS keys (it only uses them through EBS to restore encrypted backups), never deletes S3 buckets",
         }
         try:
             status["account_id"] = clients.account_id()
@@ -267,7 +276,8 @@ def list_warden_backups() -> dict[str, Any]:
         "REVERSIBLE, requires human approval. For each volume: takes a backup snapshot, waits until it is "
         "complete, then deletes the volume. Undo any item with restore_volume(backup_snapshot_id). Takes the "
         "plan_id from scan_for_waste and 1..max_batch (default 5) volume ids whose verdict is 'act' with "
-        "action quarantine_volume. Items that changed since the scan are skipped."
+        "action quarantine_volume. Items that changed since the scan are skipped. Backup waits share a ~3 minute "
+        "budget per call; volumes that do not fit are kept and can be retried with the same ids."
     ),
     annotations=_DESTRUCTIVE,
 )
@@ -365,8 +375,8 @@ def restore_snapshot(snapshot_id: str) -> dict[str, Any]:
     name="start_instances",
     title="Start instances Warden stopped (undo, needs approval)",
     description=(
-        "Undo for stop_instances; requires human approval. Starts 1..max_batch instances that Warden stopped "
-        "(tagged warden:stopped-at). Instances Warden did not stop are refused."
+        "Undo for stop_instances; requires human approval. Starts 1..max_batch in-scope instances that Warden "
+        "stopped (tagged warden:stopped-at and recorded in a Warden stop receipt). Others are refused."
     ),
     annotations=_REVERSIBLE,
 )

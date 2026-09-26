@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Mapping
 
 from .config import Settings
@@ -14,7 +15,8 @@ INJECTION_REASON = (
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _ENV_KEYS = {"env", "environment", "stage"}
-_PROD_VALUES = {"production", "prod"}
+# prod, prd, production, alone or followed by a separator (prod-eu, Production_US, prd.1).
+_PROD_VALUE = re.compile(r"^(?:prod|prd|production)(?:[-_ .:/].*)?$")
 _LEGAL_HOLD_KEYS = {"legal-hold", "legal_hold", "legalhold"}
 _MANAGED_BY_KEYS = {"managedby", "managed-by", "managed_by"}
 _IAC_TOOLS = {"terraform", "cloudformation", "pulumi", "cdk", "crossplane"}
@@ -26,10 +28,24 @@ _MANAGED_KEYS = {
     "karpenter.sh/nodepool": "managed by Karpenter",
     "karpenter.sh/provisioner-name": "managed by Karpenter",
     "elasticbeanstalk:environment-name": "managed by Elastic Beanstalk",
+    "eks:nodegroup-name": "part of an EKS node group",
+    "ebs.csi.aws.com/cluster": "a Kubernetes (EBS CSI) volume",
+    "csivolumename": "a Kubernetes (EBS CSI) volume",
+    "kubernetescluster": "part of a Kubernetes cluster",
+    "aws:backup:source-resource": "managed by AWS Backup",
+    "aws:dlm:lifecycle-policy-id": "managed by Data Lifecycle Manager",
+}
+# Keys that embed a cluster or claim name, so they must be matched by prefix.
+_MANAGED_PREFIXES = {
+    "kubernetes.io/cluster/": "part of a Kubernetes cluster",
+    "kubernetes.io/created-for/": "a Kubernetes persistent volume",
 }
 _INJECTION = re.compile(
-    r"\bignore\s+(?:(?:all|any|the)\s+)?(?:(?:previous|prior|above)\s+)?(?:rules|instructions|guardrails)\b"
+    r"\b(?:ignore|forget|disregard|bypass|skip)\s+(?:(?:all|any|the|your|my|of|previous|prior|above|earlier|"
+    r"these|those|safety|system)\s+)*(?:rules|instructions|guardrails|prompts?|policy|policies|checks)\b"
     r"|\bdisregard\b"
+    r"|\badmin\s+mode\b"
+    r"|^\s*(?:system|assistant)\s*:"
     r"|\bsystem\s+prompt\b"
     r"|\byou\s+are\s+now\b"
     r"|\bact\s+as\b"
@@ -69,7 +85,7 @@ def protection_reasons(tags: Mapping[str, str]) -> list[str]:
     """Reasons a resource is protected (production, legal hold, DR, explicit protect)."""
     reasons: list[str] = []
     for key, value in _lower(tags).items():
-        if key in _ENV_KEYS and value in _PROD_VALUES:
+        if key in _ENV_KEYS and _PROD_VALUE.match(value):
             reasons.append(f"protected: {key}={value} (production)")
         elif key in _LEGAL_HOLD_KEYS:
             reasons.append(f"protected: {key} tag present (legal hold)")
@@ -84,22 +100,39 @@ def managed_by_reasons(tags: Mapping[str, str]) -> list[str]:
     """Reasons a resource is owned by IaC/autoscaling and must not be touched by hand."""
     reasons: list[str] = []
     for key, value in _lower(tags).items():
+        prefix = next((p for p in _MANAGED_PREFIXES if key.startswith(p)), None)
         if key in _MANAGED_KEYS:
             reasons.append(f"{_MANAGED_KEYS[key]} (tag {key}); would come back or break deploys")
+        elif prefix:
+            reasons.append(f"{_MANAGED_PREFIXES[prefix]} (tag {key}); would come back or break deploys")
         elif key in _MANAGED_BY_KEYS and value in _IAC_TOOLS:
             reasons.append(f"managed by {value} (tag {key}); would come back or break deploys")
     return reasons
 
 
+# Common Cyrillic/Greek look-alikes of Latin letters (after NFKD).
+_CONFUSABLES = str.maketrans("аеорсухіѕјοαει",
+                             "aeopcyxisjoaei")
+
+
+def _fold(text: str) -> str:
+    """NFKD-fold, drop invisible/format chars and accents, map look-alikes (keeps punctuation)."""
+    decomposed = unicodedata.normalize("NFKD", str(text))
+    kept = "".join(ch for ch in decomposed if unicodedata.category(ch) not in ("Cf", "Mn", "Cc"))
+    return kept.lower().translate(_CONFUSABLES)
+
+
 def _normalise(text: str) -> str:
-    return re.sub(r"[\s_\-]+", " ", str(text))
+    """Folded text with all punctuation and separators collapsed to single spaces."""
+    return re.sub(r"[\W_]+", " ", _fold(text)).strip()
 
 
 def injection_reasons(tags: Mapping[str, str]) -> list[str]:
     """Flag instruction-like tag text. Returns at most one reason."""
     for key, value in (tags or {}).items():
-        if _INJECTION.search(_normalise(key)) or _INJECTION.search(_normalise(value)):
-            return [INJECTION_REASON]
+        for text in (key, value):
+            if _INJECTION.search(_normalise(text)) or _INJECTION.search(_fold(text)):
+                return [INJECTION_REASON]
     return []
 
 

@@ -21,6 +21,10 @@ LEAK_PROBLEM = (
 )
 NO_METRICS_REASON = "no CloudWatch data yet for the lookback window"
 NO_OWNER_NOTE = "no CloudTrail event in the last 90 days (events can take up to 15 minutes to appear)"
+# Boot, cloud-init and user-data make a new instance look busy; ignore this long after launch.
+BOOT_WARMUP_MINUTES = 10
+# The README promises a 7-day undo for recycled snapshots; shorter rules do not count.
+RECYCLE_MIN_RETENTION_DAYS = 7
 _CREATE_EVENTS = ("Create", "Run", "Allocate", "Copy", "Import", "Register")
 
 
@@ -111,21 +115,44 @@ def _set_verdict(finding: dict, verdict: str, reasons: list[str], action: str | 
 # --------------------------------------------------------------------------- recycle bin
 
 
-def _rule_covers_warden(rule: dict) -> bool:
+def _tag_matches(rule_tag: dict, tags: dict[str, str]) -> bool:
+    key = rule_tag.get("ResourceTagKey")
+    if key not in tags:
+        return False
+    want = rule_tag.get("ResourceTagValue")
+    return want in (None, "") or tags[key] == want
+
+
+def _retention_days(rule: dict) -> int:
+    period = rule.get("RetentionPeriod") or {}
+    if str(period.get("RetentionPeriodUnit", "")).upper() != "DAYS":
+        return 0
+    try:
+        return int(period.get("RetentionPeriodValue") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def rule_covers(rule: dict, tags: dict[str, str] | None = None) -> bool:
+    """True if this rule would keep a snapshot with these tags once Warden adds warden:recycle=true.
+
+    Tag-level rules keep a snapshot carrying any of their ResourceTags. Region-level rules keep every
+    snapshot except those matching one of their ExcludeResourceTags. Retention must be >= 7 days.
+    """
     if str(rule.get("Status", "")).lower() != "available":
         return False
-    tags = rule.get("ResourceTags") or []
-    if tags:
-        return any(
-            t.get("ResourceTagKey") == TAG_RECYCLE and t.get("ResourceTagValue") in (TAG_RECYCLE_VALUE, None, "")
-            for t in tags
-        )
-    excluded = rule.get("ExcludeResourceTags") or []
-    return not any(t.get("ResourceTagKey") == TAG_RECYCLE for t in excluded)
+    if _retention_days(rule) < RECYCLE_MIN_RETENTION_DAYS:
+        return False
+    effective = {**(tags or {}), TAG_RECYCLE: TAG_RECYCLE_VALUE}
+    included = rule.get("ResourceTags") or []
+    if included:
+        return any(_tag_matches(t, effective) for t in included)
+    return not any(_tag_matches(t, effective) for t in rule.get("ExcludeResourceTags") or [])
 
 
-def recycle_bin_ready(clients: AwsClients) -> bool:
-    """True when an available Recycle Bin rule keeps snapshots tagged warden:recycle=true."""
+def recycle_rules(clients: AwsClients) -> list[dict]:
+    """Available EBS_SNAPSHOT Recycle Bin rules that keep warden:recycle=true snapshots ([] on any error)."""
+    rules: list[dict] = []
     try:
         token: str | None = None
         while True:
@@ -135,13 +162,18 @@ def recycle_bin_ready(clients: AwsClients) -> bool:
             page = clients.rbin.list_rules(**kwargs)
             for summary in page.get("Rules") or []:
                 rule = clients.rbin.get_rule(Identifier=summary["Identifier"])
-                if _rule_covers_warden(rule):
-                    return True
+                if rule_covers(rule):
+                    rules.append(rule)
             token = page.get("NextToken")
             if not token:
-                return False
+                return rules
     except Exception:  # AccessDenied, not implemented, network...
-        return False
+        return []
+
+
+def recycle_bin_ready(clients: AwsClients) -> bool:
+    """True when an available Recycle Bin rule keeps snapshots tagged warden:recycle=true."""
+    return bool(recycle_rules(clients))
 
 
 # --------------------------------------------------------------------------- evidence context
@@ -306,6 +338,11 @@ def _volume_finding(vol: dict, settings: Settings, ctx: _Context, now: datetime)
     )
     if vtype == "gp2":
         f["warnings"].append("gp2 is ~20% pricier than gp3")
+    if vol.get("Encrypted"):
+        f["warnings"].append(
+            f"encrypted with KMS key {vol.get('KmsKeyId') or '(account default)'}: restore_volume needs the "
+            "Warden identity to be allowed to use this key through EBS (see iam/README.md)"
+        )
     src = _match_leak(vol, tags, ctx)
     if src is not None:
         key = (src["template_id"], src["version"], src["device"])
@@ -347,7 +384,7 @@ def _is_shared(clients: AwsClients, snap_id: str) -> bool:
 
 
 def _snapshot_finding(
-    clients: AwsClients, snap: dict, settings: Settings, ctx: _Context, now: datetime, rb_ready: bool
+    clients: AwsClients, snap: dict, settings: Settings, ctx: _Context, now: datetime, rules: list[dict]
 ) -> dict | None:
     tags = tags_to_dict(snap.get("Tags"))
     if not in_scope(tags, settings):
@@ -394,11 +431,17 @@ def _snapshot_finding(
     else:
         act_reason = "orphan: source volume is gone and no AMI uses it"
 
-    if rb_ready:
+    if any(rule_covers(rule, tags) for rule in rules):
         return _set_verdict(f, "act", [act_reason, "Recycle Bin keeps it restorable"], "recycle_snapshot")
-    f["warnings"].append(
-        "Irreversible: no Recycle Bin rule for warden:recycle=true, so deletion is permanent (one id per call)"
-    )
+    if rules:
+        f["warnings"].append(
+            "Irreversible: the Recycle Bin rule excludes this snapshot's tags, so deletion is permanent "
+            "(one id per call)"
+        )
+    else:
+        f["warnings"].append(
+            "Irreversible: no Recycle Bin rule for warden:recycle=true, so deletion is permanent (one id per call)"
+        )
     return _set_verdict(f, "act", [act_reason], "delete_snapshot")
 
 
@@ -406,9 +449,11 @@ def _snapshot_finding(
 
 
 def metric_period(lookback_minutes: int) -> int:
-    """Period (seconds): >=300, a multiple of 60, and at most 1440 datapoints."""
+    """Period (seconds): >=300, at most 1440 datapoints, and the multiple CloudWatch requires for the
+    start time's age (60 s up to 15 days, 300 s up to 63 days, 3600 s beyond)."""
     needed = math.ceil(lookback_minutes * 60 / 1440)
-    return max(300, math.ceil(needed / 60) * 60)
+    step = 3600 if lookback_minutes > 63 * 1440 else 300 if lookback_minutes > 15 * 1440 else 60
+    return max(300, math.ceil(needed / step) * step)
 
 
 def _metric(
@@ -426,22 +471,46 @@ def _metric(
     return [float(dp[stat]) for dp in resp.get("Datapoints") or [] if stat in dp]
 
 
-def _activity(clients: AwsClients, instance_id: str, settings: Settings, now: datetime) -> dict:
-    period = metric_period(settings.idle_lookback_minutes)
-    start = now - timedelta(minutes=settings.idle_lookback_minutes)
-    cpu = _metric(clients, instance_id, "CPUUtilization", "Maximum", start, now, period)
-    net_in = _metric(clients, instance_id, "NetworkIn", "Sum", start, now, period)
-    net_out = _metric(clients, instance_id, "NetworkOut", "Sum", start, now, period)
-    hours = settings.idle_lookback_minutes / 60
-    return {
-        "lookback_minutes": settings.idle_lookback_minutes,
+def _activity(
+    clients: AwsClients,
+    instance_id: str,
+    settings: Settings,
+    now: datetime,
+    launched: Any = None,
+    lookback_minutes: int | None = None,
+) -> dict:
+    """CPU/network over the lookback window, excluding the first BOOT_WARMUP_MINUTES after launch."""
+    lookback = lookback_minutes or settings.idle_lookback_minutes
+    start = now - timedelta(minutes=lookback)
+    if isinstance(launched, datetime):
+        if launched.tzinfo is None:
+            launched = launched.replace(tzinfo=timezone.utc)
+        start = max(start, launched + timedelta(minutes=BOOT_WARMUP_MINUTES))
+    window_minutes = (now - start).total_seconds() / 60
+    period = metric_period(max(5, math.ceil(window_minutes)))
+    out: dict[str, Any] = {
+        "lookback_minutes": lookback,
+        "window_start": _iso(start),
         "period_seconds": period,
-        "datapoints": len(cpu),
-        "max_cpu_pct": round(max(cpu), 2) if cpu else None,
-        "network_bytes_per_hour": round((sum(net_in) + sum(net_out)) / hours, 1) if (net_in or net_out) else None,
+        "datapoints": 0,
+        "max_cpu_pct": None,
+        "network_bytes_per_hour": None,
         "idle_cpu_pct": settings.idle_cpu_pct,
         "idle_network_bytes_per_hour": settings.idle_network_bytes_per_hour,
     }
+    if window_minutes < 5:
+        out["note"] = f"launched less than {BOOT_WARMUP_MINUTES + 5} minutes ago; boot activity is not evidence"
+        return out
+    cpu = _metric(clients, instance_id, "CPUUtilization", "Maximum", start, now, period)
+    net_in = _metric(clients, instance_id, "NetworkIn", "Sum", start, now, period)
+    net_out = _metric(clients, instance_id, "NetworkOut", "Sum", start, now, period)
+    # Divide by the time actually observed: datapoints exist only while the instance ran.
+    observed_hours = max(len(net_in), len(net_out)) * period / 3600
+    out["datapoints"] = len(cpu)
+    out["max_cpu_pct"] = round(max(cpu), 2) if cpu else None
+    if observed_hours:
+        out["network_bytes_per_hour"] = round((sum(net_in) + sum(net_out)) / observed_hours, 1)
+    return out
 
 
 def _stop_protected(clients: AwsClients, instance_id: str) -> bool:
@@ -473,7 +542,7 @@ def _instance_finding(clients: AwsClients, inst: dict, settings: Settings, now: 
     if _stop_protected(clients, iid):
         return _set_verdict(f, "keep", ["stop protection (DisableApiStop) is enabled"])
 
-    activity = _activity(clients, iid, settings, now)
+    activity = _activity(clients, iid, settings, now, launched=inst.get("LaunchTime"))
     f["evidence"]["activity"] = activity
     if activity["max_cpu_pct"] is None:
         return _set_verdict(f, "review", [NO_METRICS_REASON])
@@ -512,12 +581,22 @@ def _address_finding(addr: dict, settings: Settings, now: datetime) -> dict | No
 # --------------------------------------------------------------------------- enrichment
 
 
+def _first_problem(*results: str) -> str:
+    """'would_succeed' only if every step would succeed, else the first other result."""
+    return next((r for r in results if r != "would_succeed"), "would_succeed")
+
+
 def _dry_run_call(clients: AwsClients, finding: dict) -> str:
     rid, action = finding["resource_id"], finding["action"]
     ec2 = clients.ec2
     if action == "quarantine_volume":
-        return dry_run(ec2.delete_volume, VolumeId=rid)
-    if action in ("recycle_snapshot", "delete_snapshot"):
+        return _first_problem(dry_run(ec2.create_snapshot, VolumeId=rid), dry_run(ec2.delete_volume, VolumeId=rid))
+    if action == "recycle_snapshot":
+        return _first_problem(
+            dry_run(ec2.create_tags, Resources=[rid], Tags=[{"Key": TAG_RECYCLE, "Value": TAG_RECYCLE_VALUE}]),
+            dry_run(ec2.delete_snapshot, SnapshotId=rid),
+        )
+    if action == "delete_snapshot":
         return dry_run(ec2.delete_snapshot, SnapshotId=rid)
     if action == "stop_instance":
         return dry_run(ec2.stop_instances, InstanceIds=[rid])
@@ -534,6 +613,8 @@ def _apply_dry_runs(clients: AwsClients, findings: list[dict]) -> None:
         f["evidence"]["dry_run"] = result
         if result.startswith("denied"):
             _set_verdict(f, "review", f["reasons"] + [f"AWS dry run denied: {result.split(': ', 1)[-1]}"])
+        elif result != "would_succeed":
+            _set_verdict(f, "review", f["reasons"] + [f"AWS dry run did not confirm the action ({result})"])
 
 
 def _lookup_owner(clients: AwsClients, resource_id: str) -> dict:
@@ -613,7 +694,8 @@ def scan(clients: AwsClients, settings: Settings, now: datetime | None = None) -
         now = now.replace(tzinfo=timezone.utc)
     notes: list[str] = [f"prices are {pricing.PRICING_NOTE}"]
     account_id = clients.account_id()
-    rb_ready = recycle_bin_ready(clients)
+    rules = recycle_rules(clients)
+    rb_ready = bool(rules)
     if not rb_ready:
         notes.append(
             "Recycle Bin rule for warden:recycle=true not found: snapshot deletions would be permanent "
@@ -631,7 +713,7 @@ def scan(clients: AwsClients, settings: Settings, now: datetime | None = None) -
     snapshots = _list("snapshots", lambda: _paginate(ec2, "describe_snapshots", "Snapshots", OwnerIds=["self"]), notes)
     _evaluate(
         "snapshot", snapshots, "SnapshotId",
-        lambda s: _snapshot_finding(clients, s, settings, ctx, now, rb_ready), findings, notes,
+        lambda s: _snapshot_finding(clients, s, settings, ctx, now, rules), findings, notes,
     )
 
     running = [i for i in all_instances if (i.get("State") or {}).get("Name") == "running"]

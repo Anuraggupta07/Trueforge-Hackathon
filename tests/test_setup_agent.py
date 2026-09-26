@@ -194,7 +194,57 @@ def test_iam_policy_is_valid_and_denies_terminate():
     assert any(s["Action"] == "ec2:TerminateInstances" and s["Resource"] == "*" and "Condition" not in s for s in denies)
     allowed = {a for s in statements if s["Effect"] == "Allow" for a in ([s["Action"]] if isinstance(s["Action"], str) else s["Action"])}
     assert "ec2:TerminateInstances" not in allowed
-    assert not any(a.startswith(("kms:", "s3:", "iam:")) for a in allowed)
+    assert not any(a.startswith(("s3:", "iam:")) for a in allowed)
+    # KMS keys may only be *used*, and only through EBS (restoring encrypted backups).
+    for s in statements:
+        acts = [s["Action"]] if isinstance(s["Action"], str) else s["Action"]
+        if s["Effect"] == "Allow" and any(a.startswith("kms:") for a in acts):
+            assert s["Condition"]["StringLike"]["kms:ViaService"] == "ec2.*.amazonaws.com"
     conditions = json.dumps([s.get("Condition") for s in denies])
     for key in ("aws:ResourceTag/env", "aws:ResourceTag/environment", "aws:ResourceTag/legal-hold"):
         assert key in conditions
+
+
+def test_outbound_url_guard_rejection_explains_the_fix(monkeypatch, capsys):  # F1
+    class Blocked(Exception):
+        status_code = 400
+        body = {"error": {"message": 'Outbound URL blocked for host "127.0.0.1"'}}
+
+    def apply(*a, **k):
+        raise Blocked("400")
+
+    monkeypatch.setenv("TRUEFORGE_MODEL", "a/b")
+    monkeypatch.setenv("WARDEN_MCP_URL", "http://127.0.0.1:8000/mcp")
+    monkeypatch.setattr(sa, "apply", apply)
+    assert sa.main([]) == 1
+    err = capsys.readouterr().err
+    assert "OUTBOUND_URL_ALLOWED_HOSTS" in err and '"127.0.0.1"' in err
+    assert "NETWORK_POLICY_ENABLED=false" in err
+
+
+def test_env_example_documents_trueforge_network_policy():  # F1 / F2
+    text = (ROOT / ".env.example").read_text(encoding="utf-8")
+    assert "OUTBOUND_URL_ALLOWED_HOSTS" in text and "MCP_REQUEST_TIMEOUT_MS" in text
+
+
+def test_console_scripts_start_the_server():  # F7
+    import tomllib
+
+    scripts = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["scripts"]
+    assert scripts["warden"] == "warden.server:main"
+    assert scripts["warden-server"] == "warden.server:main"
+
+
+def test_sandbox_fetches_tool_data_itself():  # F5
+    for text in (sa.load_instructions(), sa.REPORTER_INSTRUCTIONS):
+        assert "from mcp_client import call_tool" in text
+        assert "call_tool(\"warden\", \"scan_for_waste\"" in text
+        assert "Write the scan JSON" not in text and "write the scan JSON" not in text
+    text = sa.load_instructions()
+    assert "call_tool(\"warden\", \"get_receipt\"" in text
+    assert "write the receipt JSON" not in text
+
+
+def test_instructions_check_receipts_after_a_tool_timeout():  # F2
+    text = sa.load_instructions()
+    assert "list_receipts" in text and "time" in text

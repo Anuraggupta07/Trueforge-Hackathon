@@ -29,14 +29,44 @@
       ]
     },
     {
-      "Sid": "WardenTagOnlyVolumesSnapshotsInstances",
+      "Sid": "WardenTagOnCreateOnly",
       "Effect": "Allow",
       "Action": "ec2:CreateTags",
       "Resource": [
         "arn:aws:ec2:*:*:volume/*",
+        "arn:aws:ec2:*::snapshot/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "ec2:CreateAction": [
+            "CreateSnapshot",
+            "CreateVolume"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "WardenOwnTagsOnly",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateTags",
+        "ec2:DeleteTags"
+      ],
+      "Resource": [
+        "arn:aws:ec2:*:*:volume/*",
         "arn:aws:ec2:*::snapshot/*",
         "arn:aws:ec2:*:*:instance/*"
-      ]
+      ],
+      "Condition": {
+        "ForAllValues:StringLike": {
+          "aws:TagKeys": [
+            "warden:*"
+          ]
+        },
+        "Null": {
+          "aws:TagKeys": "false"
+        }
+      }
     },
     {
       "Sid": "WardenDeleteVolumes",
@@ -71,6 +101,36 @@
       "Resource": "arn:aws:ec2:*:*:elastic-ip/*"
     },
     {
+      "Sid": "WardenKmsGrantOnlyForEbs",
+      "Effect": "Allow",
+      "Action": "kms:CreateGrant",
+      "Resource": "*",
+      "Condition": {
+        "StringLike": {
+          "kms:ViaService": "ec2.*.amazonaws.com"
+        },
+        "Bool": {
+          "kms:GrantIsForAWSResource": "true"
+        }
+      }
+    },
+    {
+      "Sid": "WardenKmsUseOnlyThroughEbs",
+      "Effect": "Allow",
+      "Action": [
+        "kms:Decrypt",
+        "kms:DescribeKey",
+        "kms:GenerateDataKeyWithoutPlaintext",
+        "kms:ReEncrypt*"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringLike": {
+          "kms:ViaService": "ec2.*.amazonaws.com"
+        }
+      }
+    },
+    {
       "Sid": "DenyTerminateAlways",
       "Effect": "Deny",
       "Action": "ec2:TerminateInstances",
@@ -87,8 +147,15 @@
       ],
       "Resource": "*",
       "Condition": {
-        "StringEqualsIgnoreCase": {
-          "aws:ResourceTag/env": ["production", "prod", "Production", "PROD"]
+        "StringLike": {
+          "aws:ResourceTag/env": [
+            "prod*",
+            "Prod*",
+            "PROD*",
+            "prd*",
+            "Prd*",
+            "PRD*"
+          ]
         }
       }
     },
@@ -103,8 +170,38 @@
       ],
       "Resource": "*",
       "Condition": {
-        "StringEqualsIgnoreCase": {
-          "aws:ResourceTag/environment": ["production", "prod", "Production", "PROD"]
+        "StringLike": {
+          "aws:ResourceTag/environment": [
+            "prod*",
+            "Prod*",
+            "PROD*",
+            "prd*",
+            "Prd*",
+            "PRD*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "DenyDestructiveOnProdByStageTag",
+      "Effect": "Deny",
+      "Action": [
+        "ec2:DeleteVolume",
+        "ec2:DeleteSnapshot",
+        "ec2:StopInstances",
+        "ec2:ReleaseAddress"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringLike": {
+          "aws:ResourceTag/stage": [
+            "prod*",
+            "Prod*",
+            "PROD*",
+            "prd*",
+            "Prd*",
+            "PRD*"
+          ]
         }
       }
     },
@@ -137,6 +234,61 @@
       "Condition": {
         "Null": {
           "aws:ResourceTag/legal_hold": "false"
+        }
+      }
+    },
+    {
+      "Sid": "DenyDestructiveOnLegalHoldNoSeparator",
+      "Effect": "Deny",
+      "Action": [
+        "ec2:DeleteVolume",
+        "ec2:DeleteSnapshot",
+        "ec2:StopInstances",
+        "ec2:ReleaseAddress"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "Null": {
+          "aws:ResourceTag/legalhold": "false"
+        }
+      }
+    },
+    {
+      "Sid": "DenyDestructiveOnDrTag",
+      "Effect": "Deny",
+      "Action": [
+        "ec2:DeleteVolume",
+        "ec2:DeleteSnapshot",
+        "ec2:StopInstances",
+        "ec2:ReleaseAddress"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "Null": {
+          "aws:ResourceTag/dr": "false"
+        },
+        "StringNotEqualsIgnoreCase": {
+          "aws:ResourceTag/dr": [
+            "false",
+            "no",
+            "0"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "DenyDestructiveOnDrRole",
+      "Effect": "Deny",
+      "Action": [
+        "ec2:DeleteVolume",
+        "ec2:DeleteSnapshot",
+        "ec2:StopInstances",
+        "ec2:ReleaseAddress"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEqualsIgnoreCase": {
+          "aws:ResourceTag/role": "dr"
         }
       }
     },

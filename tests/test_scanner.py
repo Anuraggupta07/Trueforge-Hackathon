@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -109,8 +110,10 @@ def world(aws):
     ids["quiet_i"] = _instance(ec2, ami, _tags(Name="quiet"))
     ids["idle_i"] = _instance(ec2, ami, _tags(Name="idle"))
     ids["busy_i"] = _instance(ec2, ami, _tags(Name="busy"))
-    _put_metrics(cw, ids["idle_i"], cpu=1.5, net=1000.0, when=now - timedelta(hours=1))
-    _put_metrics(cw, ids["busy_i"], cpu=80.0, net=1000.0, when=now - timedelta(hours=1))
+    # Metrics after the boot warm-up (moto launches instances "now"); scan with SCAN_AHEAD to see them.
+    after_boot = now + timedelta(minutes=scanner.BOOT_WARMUP_MINUTES + 5)
+    _put_metrics(cw, ids["idle_i"], cpu=1.5, net=1000.0, when=after_boot)
+    _put_metrics(cw, ids["busy_i"], cpu=80.0, net=1000.0, when=after_boot)
 
     free = ec2.allocate_address(Domain="vpc", TagSpecifications=[{"ResourceType": "elastic-ip", "Tags": DEMO}])
     ids["free_eip"], ids["free_ip"] = free["AllocationId"], free["PublicIp"]
@@ -134,12 +137,15 @@ def _by_id(report: dict) -> dict[str, dict]:
 
 
 def _rb(monkeypatch, ready: bool) -> None:
-    monkeypatch.setattr(scanner, "recycle_bin_ready", lambda clients: ready)
+    monkeypatch.setattr(scanner, "recycle_rules", lambda clients: [WARDEN_RULE] if ready else [])
+
+
+SCAN_AHEAD = timedelta(minutes=30)
 
 
 def test_full_world_verdicts(aws, scoped, world, monkeypatch):
     _rb(monkeypatch, True)
-    report = scanner.scan(aws, scoped)
+    report = scanner.scan(aws, scoped, now=datetime.now(timezone.utc) + SCAN_AHEAD)
     f = _by_id(report)
 
     assert report["scope"] == "warden:demo=true"
@@ -316,6 +322,7 @@ class _FakeRbin:
     ],
 )
 def test_recycle_bin_ready_rules(aws, rule, ready):
+    rule = {"RetentionPeriod": {"RetentionPeriodValue": 7, "RetentionPeriodUnit": "DAYS"}, **rule}
     aws.__dict__["rbin"] = _FakeRbin([rule])
     assert scanner.recycle_bin_ready(aws) is ready
 
@@ -329,3 +336,123 @@ def test_metric_period():
     assert scanner.metric_period(43200) == 1800
     p = scanner.metric_period(100_000)
     assert p % 60 == 0 and 100_000 * 60 / p <= 1440
+
+
+# ---------------------------------------------------------------- review fixes
+
+
+WARDEN_RULE = {
+    "Status": "available",
+    "RetentionPeriod": {"RetentionPeriodValue": 7, "RetentionPeriodUnit": "DAYS"},
+    "ResourceTags": [{"ResourceTagKey": "warden:recycle", "ResourceTagValue": "true"}],
+}
+
+
+def test_metric_period_respects_cloudwatch_retention_rules():  # RA-8
+    for minutes in (30_000, 40_000, 60_000):  # 15..63 days
+        p = scanner.metric_period(minutes)
+        assert p % 300 == 0 and minutes * 60 / p <= 1440, (minutes, p)
+    for minutes in (100_000, 200_000):  # > 63 days
+        p = scanner.metric_period(minutes)
+        assert p % 3600 == 0 and minutes * 60 / p <= 1440, (minutes, p)
+
+
+class _FakeCloudWatch:
+    def __init__(self, series: dict[str, list[float]], period_ts: datetime | None = None) -> None:
+        self.series = series
+        self.calls: list[dict] = []
+
+    def get_metric_statistics(self, **kw):
+        self.calls.append(kw)
+        stat = kw["Statistics"][0]
+        return {"Datapoints": [{stat: v} for v in self.series.get(kw["MetricName"], [])]}
+
+
+class _FakeClients:
+    def __init__(self, cw) -> None:
+        self.cloudwatch = cw
+
+
+def test_network_rate_uses_observed_span_not_whole_lookback(settings):  # S9
+    s = dataclasses.replace(settings, idle_lookback_minutes=43200)
+    now = datetime.now(timezone.utc)
+    per_period = 50_000_000.0  # 50 MB in + 50 MB out per 30 min = 200 MB/h
+    n = 48  # one day of datapoints
+    cw = _FakeCloudWatch({"CPUUtilization": [1.0] * n, "NetworkIn": [per_period] * n, "NetworkOut": [per_period] * n})
+    act = scanner._activity(_FakeClients(cw), "i-1", s, now, launched=now - timedelta(days=1, hours=1))
+    # 48 datapoints of 100 MB each: the rate is per observed hour, not per hour of the 30-day lookback.
+    assert act["network_bytes_per_hour"] == pytest.approx(2 * per_period * 3600 / act["period_seconds"])
+    assert act["network_bytes_per_hour"] > s.idle_network_bytes_per_hour
+
+
+def test_boot_period_excluded_from_idle_window(settings):  # S12 / RA-1 / F4
+    s = dataclasses.replace(settings, idle_lookback_minutes=30)
+    now = datetime.now(timezone.utc)
+    launched = now - timedelta(minutes=25)
+    cw = _FakeCloudWatch({"CPUUtilization": [1.0], "NetworkIn": [10.0], "NetworkOut": [10.0]})
+    scanner._activity(_FakeClients(cw), "i-1", s, now, launched=launched)
+    assert cw.calls and all(c["StartTime"] >= launched + timedelta(minutes=scanner.BOOT_WARMUP_MINUTES) for c in cw.calls)
+
+
+def test_still_booting_instance_is_review_not_act(settings):
+    s = dataclasses.replace(settings, idle_lookback_minutes=30)
+    now = datetime.now(timezone.utc)
+    cw = _FakeCloudWatch({"CPUUtilization": [1.0], "NetworkIn": [10.0], "NetworkOut": [10.0]})
+    act = scanner._activity(_FakeClients(cw), "i-1", s, now, launched=now - timedelta(minutes=5))
+    assert act["max_cpu_pct"] is None and cw.calls == []
+
+
+@pytest.mark.parametrize(
+    "rule, tags, covered",
+    [
+        (WARDEN_RULE, {"env": "dev"}, True),
+        ({**WARDEN_RULE, "RetentionPeriod": {"RetentionPeriodValue": 1, "RetentionPeriodUnit": "DAYS"}}, {}, False),
+        ({"Status": "available", "RetentionPeriod": WARDEN_RULE["RetentionPeriod"],
+          "ExcludeResourceTags": [{"ResourceTagKey": "env", "ResourceTagValue": "dev"}]}, {"env": "dev"}, False),
+        ({"Status": "available", "RetentionPeriod": WARDEN_RULE["RetentionPeriod"],
+          "ExcludeResourceTags": [{"ResourceTagKey": "env", "ResourceTagValue": "dev"}]}, {"env": "qa"}, True),
+        ({"Status": "available", "RetentionPeriod": WARDEN_RULE["RetentionPeriod"],
+          "ExcludeResourceTags": [{"ResourceTagKey": "team"}]}, {"team": "x"}, False),
+    ],
+)
+def test_rule_covers_checks_the_snapshots_own_tags(rule, tags, covered):  # S5
+    assert scanner.rule_covers(rule, tags) is covered
+
+
+def test_excluded_snapshot_is_not_offered_as_reversible(aws, scoped, world, monkeypatch):  # S5
+    region_rule = {"Status": "available", "RetentionPeriod": WARDEN_RULE["RetentionPeriod"],
+                   "ExcludeResourceTags": [{"ResourceTagKey": "Name", "ResourceTagValue": "old-build"}]}
+    monkeypatch.setattr(scanner, "recycle_rules", lambda clients: [region_rule])
+    f = _by_id(scanner.scan(aws, scoped))
+    assert f[world["orphan_snap"]]["action"] == "delete_snapshot"
+    assert f[world["expired_backup"]]["action"] == "recycle_snapshot"
+
+
+def test_dry_run_other_error_downgrades_to_review(aws, scoped, world, monkeypatch):  # S13
+    _rb(monkeypatch, True)
+    monkeypatch.setattr(scanner, "dry_run", lambda call, **kw: "error: InvalidParameterValue")
+    report = scanner.scan(aws, scoped)
+    plain = _by_id(report)[world["plain_vol"]]
+    assert plain["verdict"] == "review"
+    assert report["summary"]["act"] == 0
+
+
+def test_dry_run_covers_every_step_of_the_action(aws, scoped, world, monkeypatch):  # S13
+    _rb(monkeypatch, True)
+    calls: list[str] = []
+
+    def spy(call, **kw):
+        calls.append(call.__name__)
+        return "would_succeed"
+
+    monkeypatch.setattr(scanner, "dry_run", spy)
+    scanner.scan(aws, scoped)
+    assert "create_snapshot" in calls and "delete_volume" in calls
+    assert "create_tags" in calls and "delete_snapshot" in calls
+
+
+def test_encrypted_volume_warns_about_kms_restore(settings):  # S11
+    vol = {"VolumeId": "vol-1", "State": "available", "Size": 10, "VolumeType": "gp3",
+           "Encrypted": True, "KmsKeyId": "arn:aws:kms:us-east-1:123456789012:key/abc"}
+    f = scanner._volume_finding(vol, settings, scanner._Context(), datetime.now(timezone.utc))
+    assert any("KMS" in w and "key/abc" in w for w in f["warnings"])

@@ -53,13 +53,13 @@ def run_checks(clients: AwsClients, settings: Settings) -> list[dict[str, str]]:
     rows.append(_safe("Region", "all EC2 work in this region", region))
 
     def vpc() -> dict[str, str]:
-        subnet = default_subnet(clients)
+        subnet = default_subnet(clients, "t3.micro")  # the instance type plant.py launches
         if subnet is None:
-            return _row("Default VPC + subnet", BLOCKED, "no default VPC/subnet found",
+            return _row("Default VPC + subnet", BLOCKED, "no default VPC/subnet in an AZ offering t3.micro",
                         "plant.py (instances, launch-template leak demo)")
         ctx["subnet"] = subnet
         return _row("Default VPC + subnet", OK,
-                    f"{subnet['VpcId']} / {subnet['SubnetId']} in {subnet['AvailabilityZone']}")
+                    f"{subnet['VpcId']} / {subnet['SubnetId']} in {subnet['AvailabilityZone']} (offers t3.micro)")
 
     rows.append(_safe("Default VPC + subnet", "plant.py (instances, leak demo)", vpc))
 
