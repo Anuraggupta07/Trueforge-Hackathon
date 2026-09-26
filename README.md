@@ -281,3 +281,5 @@ tests/          491 tests (moto-based; no AWS account needed)
 ## AI tools used
 
 **Claude Code** (Anthropic) was used as a coding assistant. The team reviewed, tested and can explain all of the code.
+
+The demo video's narration is an AI voice (Microsoft neural text-to-speech via `edge-tts`). The video was recorded and edited automatically (Playwright screen capture and ffmpeg) with Claude Code. The on-screen run itself is live: a real TrueForge session, the real Warden server and the local AWS simulator.
