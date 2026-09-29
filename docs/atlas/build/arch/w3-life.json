@@ -1,0 +1,234 @@
+{
+  "schema_version": 1,
+  "diagram_type": "lifecycle",
+  "meta": {
+    "title": "Warden: life of one item",
+    "locale": "en",
+    "viewBox": [
+      1080,
+      630
+    ],
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "happy",
+        "label": "Proposed to done",
+        "focus": [
+          "found",
+          "judged",
+          "signed",
+          "approved",
+          "done"
+        ],
+        "note": "Scan, verdict, Watchdog slip, your Allow, then a reversible change with a receipt."
+      },
+      {
+        "id": "refuse",
+        "label": "Refused or skipped",
+        "focus": [
+          "judged",
+          "review",
+          "refused",
+          "approved",
+          "skipped"
+        ],
+        "note": "Protected items are refused with a reason; anything that changed after approval is skipped."
+      },
+      {
+        "id": "undo",
+        "label": "Undo window",
+        "focus": [
+          "done",
+          "window",
+          "undone"
+        ],
+        "note": "Receipts keep the undo path open: restore the disk, restore the snapshot, start the server."
+      }
+    ]
+  },
+  "lanes": [
+    {
+      "id": "main",
+      "label": "One item"
+    },
+    {
+      "id": "waits",
+      "label": "Waiting"
+    },
+    {
+      "id": "terminal",
+      "label": "Other endings"
+    }
+  ],
+  "states": [
+    {
+      "id": "found",
+      "type": "start",
+      "label": "Found",
+      "sublabel": "read-only scan",
+      "lane": "main",
+      "col": 0,
+      "step": "01",
+      "tag": "scanner"
+    },
+    {
+      "id": "judged",
+      "type": "decision",
+      "label": "Judged",
+      "sublabel": "safe · review · no",
+      "lane": "main",
+      "col": 1,
+      "step": "02",
+      "tag": "policy"
+    },
+    {
+      "id": "signed",
+      "type": "active",
+      "label": "Signed",
+      "sublabel": "single-use slip",
+      "lane": "main",
+      "col": 2,
+      "step": "03",
+      "tag": "watchdog"
+    },
+    {
+      "id": "approved",
+      "type": "active",
+      "label": "Approved",
+      "sublabel": "your Allow",
+      "lane": "main",
+      "col": 3,
+      "step": "04",
+      "tag": "TrueForge"
+    },
+    {
+      "id": "done",
+      "type": "success",
+      "label": "Done",
+      "sublabel": "receipt written",
+      "lane": "main",
+      "col": 4,
+      "step": "05",
+      "tag": "actions"
+    },
+    {
+      "id": "review",
+      "type": "waiting",
+      "label": "Needs review",
+      "sublabel": "looks like prod",
+      "lane": "waits",
+      "col": 0,
+      "tag": "you decide"
+    },
+    {
+      "id": "window",
+      "type": "waiting",
+      "label": "Undo window",
+      "sublabel": "rollback_window",
+      "lane": "waits",
+      "col": 2,
+      "tag": "countdown"
+    },
+    {
+      "id": "refused",
+      "type": "failure",
+      "label": "Refused",
+      "sublabel": "protected, with reason",
+      "lane": "terminal",
+      "col": 0,
+      "tag": "never touched"
+    },
+    {
+      "id": "skipped",
+      "type": "neutral",
+      "label": "Skipped",
+      "sublabel": "changed since Allow",
+      "lane": "terminal",
+      "col": 1,
+      "tag": "re-check"
+    },
+    {
+      "id": "undone",
+      "type": "success",
+      "label": "Undone",
+      "sublabel": "restore / start",
+      "lane": "terminal",
+      "col": 2,
+      "tag": "undo tool"
+    }
+  ],
+  "transitions": [
+    {
+      "from": "judged",
+      "to": "review",
+      "label": "unsure",
+      "variant": "dashed",
+      "labelAt": [
+        282,
+        300
+      ]
+    },
+    {
+      "from": "judged",
+      "to": "refused",
+      "label": "protected",
+      "variant": "security",
+      "labelAt": [
+        276,
+        420
+      ]
+    },
+    {
+      "from": "approved",
+      "to": "skipped",
+      "label": "changed",
+      "variant": "dashed",
+      "labelDy": 38
+    },
+    {
+      "from": "done",
+      "to": "window",
+      "label": "receipt",
+      "route": "straight",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 24
+    },
+    {
+      "from": "window",
+      "to": "undone",
+      "label": "undo",
+      "variant": "emphasis",
+      "route": "straight",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 24
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Reversible by default",
+      "items": [
+        "Disk: backup, then delete; snapshot: Recycle Bin",
+        "Server: stop, never terminate"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Permanent steps wait",
+      "items": [
+        "An IP is quarantined first, released later",
+        "Release is approved one IP at a time"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Refusals are final",
+      "items": [
+        "Protected, managed or in-use items are never touched",
+        "Tag text trying to give orders is flagged as an attack"
+      ]
+    }
+  ]
+}

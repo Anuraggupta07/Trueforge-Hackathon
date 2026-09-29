@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "Warden: one approved cleanup",
+    "locale": "en",
+    "viewBox": [1080, 632],
+    "column_fit": "spread",
+    "quality_profile": "showcase",
+    "views": [
+      { "id": "scan", "label": "Scan", "focus": ["trueforge", "server", "aws"], "note": "A read-only scan builds findings and locks the certified IDs into a plan." },
+      { "id": "verify", "label": "Watchdog", "focus": ["trueforge", "watchdog", "aws"], "note": "The Watchdog re-reads AWS itself and returns a single-use, HMAC-signed slip." },
+      { "id": "act", "label": "Allow and act", "focus": ["operator", "trueforge", "server", "aws", "ledger"], "note": "TrueForge pauses for your Allow; the action backs up first and writes a receipt." }
+    ]
+  },
+  "participants": [
+    { "id": "operator", "type": "external", "label": "You", "sublabel": "operator" },
+    { "id": "trueforge", "type": "frontend", "label": "TrueForge", "sublabel": "agent + approvals" },
+    { "id": "server", "type": "backend", "label": "Warden tools", "sublabel": "server.py" },
+    { "id": "watchdog", "type": "security", "label": "Watchdog", "sublabel": "watchdog.py" },
+    { "id": "aws", "type": "cloud", "label": "AWS", "sublabel": "or simulator" },
+    { "id": "ledger", "type": "database", "label": "Ledger", "sublabel": ".warden" }
+  ],
+  "segments": [
+    { "from": 150, "to": 236, "label": "Scan" },
+    { "from": 264, "to": 350, "label": "Verify" },
+    { "from": 378, "to": 436, "label": "Approve" },
+    { "from": 464, "to": 548, "label": "Act" }
+  ],
+  "messages": [
+    { "from": "trueforge", "to": "server", "y": 168, "label": "scan_for_waste", "variant": "emphasis" },
+    { "from": "server", "to": "aws", "y": 196, "label": "read-only scan", "variant": "default" },
+    { "from": "server", "to": "trueforge", "y": 224, "label": "locked plan", "variant": "return" },
+    { "from": "trueforge", "to": "watchdog", "y": 282, "label": "watchdog_verify", "variant": "security" },
+    { "from": "watchdog", "to": "aws", "y": 310, "label": "re-read", "variant": "default" },
+    { "from": "watchdog", "to": "trueforge", "y": 338, "label": "single-use slip", "variant": "return" },
+    { "from": "trueforge", "to": "operator", "y": 396, "label": "Allow?", "variant": "security" },
+    { "from": "operator", "to": "trueforge", "y": 424, "label": "Allow", "variant": "emphasis" },
+    { "from": "trueforge", "to": "server", "y": 482, "label": "quarantine_volumes", "variant": "emphasis" },
+    { "from": "server", "to": "aws", "y": 510, "label": "backup, then delete", "variant": "emphasis" },
+    { "from": "server", "to": "ledger", "y": 538, "label": "receipt", "variant": "default" }
+  ],
+  "activations": [
+    { "participant": "server", "from": 162, "to": 230 },
+    { "participant": "watchdog", "from": 276, "to": 344 },
+    { "participant": "server", "from": 476, "to": 544 }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "Read before write", "items": ["The scan and the Watchdog only read AWS", "Only the action tool changes anything"] },
+    { "dot": "rose", "title": "Nothing without the slip", "items": ["The action refuses a missing or used slip", "The slip expires after its TTL"] },
+    { "dot": "emerald", "title": "Every call is recorded", "items": ["Receipts and sign-offs go to the ledger", "Ask later: did you touch my prod disk?"] }
+  ]
+}

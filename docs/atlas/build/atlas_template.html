@@ -1,0 +1,648 @@
+<title>Warden Architecture Atlas</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+:root{
+  --bg:#F1F4F6; --surface:#FFFFFF; --surface-2:#E6ECEF; --surface-3:#F7F9FA;
+  --ink:#101C24; --ink-2:#465864; --ink-3:#7A8B96;
+  --line:#CCD6DC; --line-2:#DFE6EA;
+  --accent:#0B6F77; --accent-soft:#D6EBEC;
+  --shield:#3E4FA8; --shield-soft:#E2E6F7;
+  --danger:#A6343F; --danger-soft:#F6E1E3;
+  --warn:#8E6408; --warn-soft:#F6EBD2;
+  --good:#2C7A45; --good-soft:#E0F1E5;
+  --shadow:0 1px 2px rgba(16,28,36,.05), 0 8px 24px -18px rgba(16,28,36,.35);
+  --sans:"IBM Plex Sans",ui-sans-serif,system-ui,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,Consolas,monospace;
+  --disp:Archivo,ui-sans-serif,system-ui,sans-serif;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#081015; --surface:#0F1A21; --surface-2:#16242D; --surface-3:#12202A;
+    --ink:#DCE7EC; --ink-2:#98ADB8; --ink-3:#6A808C;
+    --line:#203039; --line-2:#1A2830;
+    --accent:#45C3C9; --accent-soft:#0F3035;
+    --shield:#98A6F0; --shield-soft:#1C2347;
+    --danger:#EE8A94; --danger-soft:#3A1A1F;
+    --warn:#DFAE4A; --warn-soft:#2C2312;
+    --good:#72C98E; --good-soft:#15291C;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 28px -20px rgba(0,0,0,.9);
+    color-scheme:dark;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#081015; --surface:#0F1A21; --surface-2:#16242D; --surface-3:#12202A;
+  --ink:#DCE7EC; --ink-2:#98ADB8; --ink-3:#6A808C;
+  --line:#203039; --line-2:#1A2830;
+  --accent:#45C3C9; --accent-soft:#0F3035;
+  --shield:#98A6F0; --shield-soft:#1C2347;
+  --danger:#EE8A94; --danger-soft:#3A1A1F;
+  --warn:#DFAE4A; --warn-soft:#2C2312;
+  --good:#72C98E; --good-soft:#15291C;
+  --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 28px -20px rgba(0,0,0,.9);
+  color-scheme:dark;
+}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:15px;line-height:1.6;margin:0;padding-inline:16px;padding-block:0 96px;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1180px;margin:0 auto}
+a{color:var(--accent)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:3px}
+code,.mono{font-family:var(--mono);font-size:.88em}
+p code,li code,td code,figcaption code,.w code{color:var(--ink);background:var(--surface-2);padding:1px 5px;border-radius:3px}
+
+header.top{border-bottom:1px solid var(--line);padding:52px 0 28px;margin-bottom:8px}
+.eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);margin:0 0 14px}
+h1{font-family:var(--disp);font-weight:700;font-size:clamp(34px,5.4vw,54px);line-height:1.03;letter-spacing:-.022em;margin:0 0 16px;text-wrap:balance}
+.lede{font-size:17px;color:var(--ink-2);max-width:68ch;margin:0}
+.lede strong{color:var(--ink);font-weight:600}
+.facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:1px;background:var(--line-2);border:1px solid var(--line-2);border-radius:10px;overflow:hidden;margin:32px 0 0}
+.fact{background:var(--surface);padding:15px 16px 16px}
+.fact dt{font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-3);margin:0 0 6px}
+.fact dd{margin:0;font-family:var(--disp);font-weight:600;font-size:20px;letter-spacing:-.01em;font-variant-numeric:tabular-nums;line-height:1.25}
+.fact dd span{display:block;font-family:var(--sans);font-weight:400;font-size:12px;color:var(--ink-3);letter-spacing:0;margin-top:3px}
+
+nav.toc{position:sticky;top:env(safe-area-inset-top,0px);z-index:20;background:color-mix(in srgb,var(--bg) 92%,transparent);backdrop-filter:blur(6px);border-bottom:1px solid var(--line);margin:0 -16px;padding:10px 16px}
+nav.toc .in{max-width:1180px;margin:0 auto;display:flex;gap:6px;overflow-x:auto;scrollbar-width:thin}
+nav.toc a{flex:none;text-decoration:none;color:var(--ink-2);font:500 12.5px/1 var(--sans);padding:8px 10px;border-radius:6px;border:1px solid transparent;white-space:nowrap}
+nav.toc a:hover{border-color:var(--line);color:var(--ink)}
+nav.toc a b{font-family:var(--mono);font-weight:500;color:var(--accent);margin-right:6px}
+
+section{margin-top:64px;scroll-margin-top:64px}
+.sec-head{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:8px}
+.sec-alt{font-family:var(--mono);font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:2px 7px;white-space:nowrap}
+h2{font-family:var(--disp);font-weight:600;font-size:clamp(24px,3vw,31px);letter-spacing:-.018em;margin:0;line-height:1.15}
+h3{font-family:var(--disp);font-weight:600;font-size:16px;letter-spacing:-.005em;margin:30px 0 10px}
+.sec-sub{color:var(--ink-2);max-width:74ch;margin:6px 0 22px}
+
+figure{margin:0 0 8px;background:var(--surface);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);overflow:hidden}
+figure iframe{display:block;width:100%;height:clamp(620px,86vh,940px);border:0;background:var(--surface)}
+figcaption{border-top:1px solid var(--line-2);background:var(--surface-3);padding:13px 20px;font-size:13.5px;color:var(--ink-2);display:flex;gap:12px;justify-content:space-between;align-items:flex-start;flex-wrap:wrap}
+figcaption b{color:var(--ink);font-weight:600}
+figcaption span{max-width:92ch}
+.btn{appearance:none;border:1px solid var(--line);background:var(--surface);color:var(--ink);font:500 12.5px/1 var(--sans);padding:8px 11px;border-radius:6px;cursor:pointer;white-space:nowrap}
+.btn:hover{border-color:var(--accent)}
+.btn[aria-pressed="true"]{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+
+ul.notes{list-style:none;padding:0;margin:18px 0 0;display:grid;gap:10px}
+ul.notes li{padding-left:22px;position:relative;color:var(--ink-2);max-width:80ch;font-size:14px}
+ul.notes li::before{content:"";position:absolute;left:2px;top:9px;width:7px;height:7px;border:1.5px solid var(--accent);border-radius:1px}
+ul.notes li b{color:var(--ink);font-weight:600}
+
+.tbl-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:10px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;min-width:720px;font-size:13.5px}
+th,td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--line-2);vertical-align:top}
+thead th{font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-3);font-weight:500;background:var(--surface-3);border-bottom:1px solid var(--line)}
+tbody tr:last-child td{border-bottom:none}
+td.num{font-variant-numeric:tabular-nums;font-family:var(--mono);font-size:12.5px;white-space:nowrap}
+.pill{display:inline-block;font-family:var(--mono);font-size:10px;letter-spacing:.05em;text-transform:uppercase;padding:2px 7px;border-radius:3px;border:1px solid currentColor;white-space:nowrap}
+.p-read{color:var(--ink-3)} .p-act{color:var(--accent)} .p-final{color:var(--danger)} .p-undo{color:var(--good)} .p-verify{color:var(--shield)}
+.lnk{font-family:var(--mono);font-size:12px;color:var(--accent);text-decoration:none;border-bottom:1px dotted currentColor;cursor:pointer;background:none;border-top:0;border-left:0;border-right:0;padding:0}
+.lnk:hover{border-bottom-style:solid}
+.chips{display:flex;flex-wrap:wrap;gap:5px}
+
+.callout{border:1px solid var(--warn);background:var(--warn-soft);border-radius:10px;padding:16px 20px;margin-top:22px;font-size:14px;color:var(--ink-2);max-width:84ch}
+.callout b.h{color:var(--ink);display:block;font-family:var(--disp);font-weight:600;font-size:14px;margin-bottom:6px}
+.callout ul{margin:6px 0 0;padding-left:18px;display:grid;gap:5px}
+
+/* layers map */
+.layers{padding:16px 16px 6px;overflow-x:auto}
+.layers svg{display:block;width:100%;min-width:920px;height:auto}
+.lband{fill:var(--surface-3);stroke:var(--line-2)}
+.lbt{font:600 12.5px var(--disp);fill:var(--ink)}
+.lbs{font:400 10px var(--mono);fill:var(--ink-3)}
+.mbox rect{stroke-width:1.3;cursor:pointer}
+.mbox .mn{font:500 11.5px var(--mono);fill:var(--ink);pointer-events:none}
+.mbox .ms{font:400 9.5px var(--mono);fill:var(--ink-3);pointer-events:none}
+.mbox .mr{font:600 10px var(--disp);letter-spacing:.06em;text-transform:uppercase;pointer-events:none}
+.edge{fill:none;stroke:var(--ink-3);stroke-width:1.1;opacity:.28;transition:opacity .15s}
+.edge.on-out{stroke:var(--accent);opacity:1;stroke-width:1.8}
+.edge.on-in{stroke:var(--shield);opacity:1;stroke-width:1.8}
+.mbox.dim rect{opacity:.35}
+.mbox.dim text{opacity:.4}
+.lg{display:flex;flex-wrap:wrap;gap:8px 22px;padding:10px 18px 14px;font-size:12.5px;color:var(--ink-2)}
+.lg i{display:inline-block;width:22px;height:0;border-top:2px solid;vertical-align:middle;margin-right:7px}
+
+/* inventory */
+.inv{display:grid;grid-template-columns:250px minmax(0,1fr);gap:22px;align-items:start}
+.side{position:sticky;top:70px;max-height:calc(100vh - 90px);overflow:auto;border:1px solid var(--line);border-radius:10px;background:var(--surface);padding:8px}
+.side button{display:flex;justify-content:space-between;gap:8px;width:100%;appearance:none;border:0;background:none;text-align:left;padding:7px 9px;border-radius:6px;cursor:pointer;color:var(--ink-2);font:400 12.5px/1.3 var(--mono)}
+.side button:hover{background:var(--surface-2);color:var(--ink)}
+.side button[aria-pressed="true"]{background:var(--accent-soft);color:var(--ink)}
+.side button span{color:var(--ink-3)}
+.side .grp{font:600 10px/1 var(--disp);letter-spacing:.1em;text-transform:uppercase;color:var(--ink-3);padding:12px 9px 6px}
+.tools{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:14px}
+.tools input[type=search]{flex:1;min-width:220px;font:400 14px var(--sans);padding:9px 12px;border-radius:8px;border:1px solid var(--line);background:var(--surface);color:var(--ink)}
+.tools select{font:400 13px var(--sans);padding:8px 10px;border-radius:8px;border:1px solid var(--line);background:var(--surface);color:var(--ink)}
+.count{font:500 12.5px var(--mono);color:var(--ink-3);margin:-4px 0 14px}
+.modcard{border:1px solid var(--line);border-radius:12px;background:var(--surface);margin-bottom:18px;overflow:hidden;scroll-margin-top:70px}
+.modhead{padding:16px 18px 14px;border-bottom:1px solid var(--line-2);background:var(--surface-3);display:grid;gap:8px}
+.modhead .row1{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+.modhead h3{margin:0;font-family:var(--mono);font-weight:500;font-size:16px}
+.modhead .meta{font:400 12px var(--mono);color:var(--ink-3)}
+.modhead p{margin:0;color:var(--ink-2);font-size:14px;max-width:90ch}
+.modhead .deps{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12.5px;color:var(--ink-3)}
+.role{font-family:var(--mono);font-size:10px;letter-spacing:.06em;text-transform:uppercase;padding:2px 7px;border-radius:3px;background:var(--surface-2);color:var(--ink-2)}
+details.consts{padding:0 18px}
+details.consts summary{cursor:pointer;font-size:12.5px;color:var(--ink-3);padding:8px 0}
+details.consts table{min-width:0;font-size:12px;margin-bottom:10px}
+details.consts td{padding:4px 8px;font-family:var(--mono);word-break:break-word}
+.blk{border-top:1px solid var(--line-2);scroll-margin-top:80px}
+.blk:first-of-type{border-top:0}
+.blk > summary{list-style:none;cursor:pointer;display:grid;grid-template-columns:74px minmax(170px,280px) minmax(0,1fr);gap:12px;align-items:baseline;padding:10px 18px}
+.blk > summary::-webkit-details-marker{display:none}
+.blk > summary:hover{background:var(--surface-3)}
+.blk.sub > summary{padding-left:40px}
+.blk.sub2 > summary{padding-left:62px}
+.kb{font:500 10px/1.4 var(--mono);letter-spacing:.04em;text-transform:uppercase;color:var(--ink-3)}
+.kb.tool{color:var(--accent)} .kb.cls{color:var(--shield)}
+.bn{font:500 13px/1.4 var(--mono);color:var(--ink);word-break:break-word}
+.bw{font-size:13.5px;color:var(--ink-2)}
+.bw .tg{display:inline-block;font:500 9.5px/1 var(--mono);letter-spacing:.04em;text-transform:uppercase;padding:3px 5px;border-radius:3px;margin-left:5px;vertical-align:1px;background:var(--surface-2);color:var(--ink-3)}
+.tg.t-destructive,.tg.t-aws-write{background:var(--danger-soft);color:var(--danger)}
+.tg.t-safety-gate,.tg.t-hmac,.tg.t-approval{background:var(--shield-soft);color:var(--shield)}
+.tg.t-mcp-tool{background:var(--accent-soft);color:var(--accent)}
+.tg.t-ledger,.tg.t-backup,.tg.t-recycle-bin{background:var(--good-soft);color:var(--good)}
+.bd{padding:4px 18px 16px 104px;display:grid;gap:9px;font-size:13.5px}
+.blk.sub .bd{padding-left:126px} .blk.sub2 .bd{padding-left:148px}
+.bd pre{margin:0;background:var(--surface-2);border-radius:7px;padding:10px 12px;font:12.5px/1.5 var(--mono);white-space:pre-wrap;word-break:break-word;color:var(--ink)}
+.bd pre.doc{background:var(--surface-3);border:1px solid var(--line-2);color:var(--ink-2);font-family:var(--sans);font-size:13px}
+.kv{display:grid;grid-template-columns:96px minmax(0,1fr);gap:4px 12px;align-items:baseline}
+.kv dt{font:500 10px/1.6 var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--ink-3)}
+.kv dd{margin:0;color:var(--ink-2)}
+.flash{animation:flash 1.6s ease}
+@keyframes flash{0%{background:var(--accent-soft)}100%{background:transparent}}
+@media (prefers-reduced-motion: reduce){.flash{animation:none}.edge{transition:none}}
+.none{padding:24px;text-align:center;color:var(--ink-3);border:1px dashed var(--line);border-radius:10px}
+
+.twocol{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:16px 18px;display:grid;gap:8px;align-content:start}
+.card h3{margin:0}
+.card p{margin:0;color:var(--ink-2);font-size:14px}
+.card ul{margin:0;padding-left:18px;display:grid;gap:4px;font-size:13.5px;color:var(--ink-2)}
+
+footer{margin-top:72px;padding-top:24px;border-top:1px solid var(--line);font-size:12.5px;color:var(--ink-3)}
+footer h4{font-family:var(--disp);font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-2);margin:0 0 10px}
+footer ul{margin:0 0 14px;padding-left:18px;columns:2;column-gap:36px}
+footer li{margin-bottom:4px;break-inside:avoid}
+
+@media (max-width:980px){
+  .inv{grid-template-columns:1fr}
+  .side{position:static;max-height:none;display:none}
+  .twocol{grid-template-columns:1fr}
+}
+@media (max-width:700px){
+  .blk > summary{grid-template-columns:60px minmax(0,1fr);padding:10px 12px}
+  .blk > summary .bw{grid-column:1 / -1}
+  .blk.sub > summary,.blk.sub2 > summary{padding-left:24px}
+  .bd,.blk.sub .bd,.blk.sub2 .bd{padding:4px 12px 14px 12px}
+  .kv{grid-template-columns:1fr}
+  footer ul{columns:1}
+}
+</style>
+
+<div class="wrap">
+<header class="top">
+  <p class="eyebrow">Warden · TrueForge × Polaris hackathon · <span id="commit"></span></p>
+  <h1>Warden Architecture Atlas</h1>
+  <p class="lede">Every module, every function and every safety gate in <strong>Warden</strong>, the approval-gated AWS cleanup agent, read out of the repository.
+  Four maps show the system from outside in. Below them, the <strong>block inventory</strong> lists all <strong id="lede-blocks"></strong> code blocks with what each does, where it lives, what it calls and what calls it.</p>
+  <dl class="facts" id="facts"></dl>
+</header>
+</div>
+
+<nav class="toc" aria-label="Sections"><div class="in">
+  <a href="#hld"><b>1</b>System context</a>
+  <a href="#dfd"><b>2</b>Data flow</a>
+  <a href="#layers"><b>3</b>Code layers</a>
+  <a href="#life"><b>4</b>Item lifecycle</a>
+  <a href="#seq"><b>5</b>One cleanup</a>
+  <a href="#tools"><b>6</b>MCP tools</a>
+  <a href="#inventory"><b>7</b>Every block</a>
+  <a href="#invariants"><b>8</b>Invariants</a>
+  <a href="#config"><b>9</b>Settings</a>
+  <a href="#ops"><b>10</b>Demo &amp; ops</a>
+  <a href="#tests"><b>11</b>Tests</a>
+</div></nav>
+
+<div class="wrap">
+
+<section id="hld">
+  <div class="sec-head"><span class="sec-alt">Altitude 1 · system context</span><h2>Who talks to whom</h2></div>
+  <p class="sec-sub">You chat with a TrueForge agent. The agent can reach AWS only through Warden's MCP server, which holds the AWS credentials, runs the Watchdog and writes the ledger. The Daytona sandbox runs proof scripts and never holds cloud or model keys.</p>
+  <figure><div data-diagram="w1-hld" data-title="System context diagram"></div>
+    <figcaption><span><b>One path to AWS, two locks around it.</b> The IAM policy in <code>iam/warden-policy.json</code> denies production changes at AWS itself, so a code bug still hits a wall. In demo mode <code>WARDEN_MOCK_ENDPOINT</code> points boto3 at a local moto server instead.</span><button class="btn fs" type="button">Full screen</button></figcaption></figure>
+  <ul class="notes">
+    <li><b>The server is <code>warden.server:main</code></b>, a FastMCP app on streamable HTTP at <code>/mcp</code> (port 8000). The same process serves the read-only console at <code>/console</code>, <code>/console/api/state</code> and <code>/console/api/simulator</code>.</li>
+    <li><b>TrueForge pauses on 10 tools.</b> <code>agent/setup_agent.py</code> registers the MCP server and lists every action and undo tool in <code>require_approval_for_tools</code>.</li>
+    <li><b>The Watchdog is independent code, not a separate machine.</b> It never imports the Executor, re-reads AWS with its own calls and signs a single-use HMAC slip that <code>actions.py</code> must consume before it acts.</li>
+  </ul>
+</section>
+
+<section id="dfd">
+  <div class="sec-head"><span class="sec-alt">Altitude 2 · data flow</span><h2>How one cleanup flows</h2></div>
+  <p class="sec-sub">Five stages, left to right. Each stage can stop the rest: an ID that isn't in the locked plan, a missing slip, or a Deny ends the flow before AWS is touched.</p>
+  <figure><div data-diagram="w2-dfd" data-title="Data flow diagram"></div>
+    <figcaption><span><b>Read before write.</b> Only the action tool changes AWS, and only after the plan, the slip and your Allow line up. The dashboard is built by <code>ui.py</code> from Warden's own data, so the model never retypes IDs or numbers.</span><button class="btn fs" type="button">Full screen</button></figcaption></figure>
+  <h3>Flow inventory</h3>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>#</th><th>Flow</th><th>What moves</th><th>Owned by</th></tr></thead>
+    <tbody id="flows"></tbody>
+  </table></div>
+</section>
+
+<section id="layers">
+  <div class="sec-head"><span class="sec-alt">Altitude 3 · internal structure</span><h2>Code layers and imports</h2></div>
+  <p class="sec-sub">All 20 Python modules, placed by role. Lines are real <code>import</code> statements. Hover a module to see what it imports (teal) and what imports it (indigo); click it to open its blocks in the inventory.</p>
+  <figure><div class="layers" id="layers-svg"></div>
+    <div class="lg"><span><i style="border-color:var(--accent)"></i>imports (outgoing)</span><span><i style="border-color:var(--shield)"></i>imported by (incoming)</span><span>Box text: role · module · blocks · lines</span></div>
+    <figcaption><span><b>Dependency flows downward.</b> <code>config</code>, <code>pricing</code> and <code>ui</code> import nothing internal. <code>watchdog</code> imports <code>audit</code>, <code>plan</code> and <code>policy</code> but never <code>actions</code>, which is what keeps the sign-off independent of the code it gates.</span></figcaption></figure>
+</section>
+
+<section id="life">
+  <div class="sec-head"><span class="sec-alt">State</span><h2>Life of one item</h2></div>
+  <p class="sec-sub">What can happen to one disk, snapshot, server or IP between the scan and the undo window.</p>
+  <figure><div data-diagram="w3-life" data-title="Lifecycle diagram"></div>
+    <figcaption><span><b>Refusals are final and explained.</b> <code>policy.keep_reasons</code> returns protection, managed-by and injection reasons; <code>scanner._prod_guard</code> downgrades production-looking names to review.</span><button class="btn fs" type="button">Full screen</button></figcaption></figure>
+</section>
+
+<section id="seq">
+  <div class="sec-head"><span class="sec-alt">Sequence</span><h2>One approved cleanup, call by call</h2></div>
+  <p class="sec-sub">A disk cleanup from the agent's first tool call to the receipt.</p>
+  <figure><div data-diagram="w4-seq" data-title="Sequence diagram"></div>
+    <figcaption><span><b>The slip is consumed on use.</b> <code>watchdog.check_signoff</code> validates and consumes it atomically, so replaying the same approval does nothing.</span><button class="btn fs" type="button">Full screen</button></figcaption></figure>
+</section>
+
+<section id="tools">
+  <div class="sec-head"><span class="sec-alt">Contract</span><h2>The 19 MCP tools</h2></div>
+  <p class="sec-sub">In the order <code>server.py</code> registers them. "Approval" means TrueForge pauses for Allow / Deny before the call runs.</p>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Tool</th><th>Group</th><th>Approval</th><th>What it does</th><th>MCP hints</th></tr></thead>
+    <tbody id="tool-rows"></tbody>
+  </table></div>
+</section>
+
+<section id="inventory">
+  <div class="sec-head"><span class="sec-alt">Complete</span><h2>Every block</h2></div>
+  <p class="sec-sub">Every class, function, method and nested helper in <code>src/warden</code>, <code>scripts</code> and <code>agent</code>. Click a row to see its signature, docstring, location, the Warden blocks it calls and the blocks that call it.</p>
+  <div class="inv">
+    <aside class="side" id="side" aria-label="Modules"></aside>
+    <div>
+      <div class="tools">
+        <input type="search" id="q" placeholder="Search names, descriptions, docstrings, signatures" aria-label="Search blocks">
+        <select id="f-kind" aria-label="Kind"><option value="">All kinds</option><option value="function">Functions</option><option value="method">Methods</option><option value="class">Classes</option><option value="nested">Nested helpers</option></select>
+        <select id="f-tag" aria-label="Tag"><option value="">All tags</option></select>
+        <select id="f-mod" aria-label="Module"><option value="">All modules</option></select>
+        <button class="btn" id="exp" type="button">Expand all</button>
+      </div>
+      <p class="count" id="count"></p>
+      <div id="inv-list"></div>
+    </div>
+  </div>
+</section>
+
+<section id="invariants">
+  <div class="sec-head"><h2>Invariants, and the code that enforces them</h2></div>
+  <p class="sec-sub">Each rule is paired with the functions that hold it. A rule written only in the agent's instructions can be talked around; these run in code.</p>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Invariant</th><th>How it holds</th><th>Enforced by</th></tr></thead>
+    <tbody id="inv-rows"></tbody>
+  </table></div>
+  <div class="callout">
+    <b class="h">Where the code and the docs disagree</b>
+    <ul>
+      <li><code>quarantine_volumes</code> and <code>recycle_snapshots</code> are annotated <code>destructiveHint=True</code>, although both can be undone. <code>stop_instances</code>, <code>quarantine_addresses</code> and the four undo tools use <code>destructiveHint=False</code>. Approval still works, because TrueForge gates the 10 tools by name.</li>
+      <li><code>watchdog_verify</code> is annotated <code>readOnlyHint=True</code>, but it writes a sign-off file and a ledger entry.</li>
+      <li>The README's architecture sketch lists a "receipts" tool. The code registers <code>get_plan</code>, <code>get_receipt</code>, <code>list_receipts</code> and <code>list_warden_backups</code> instead; the total of 19 matches.</li>
+    </ul>
+  </div>
+</section>
+
+<section id="config">
+  <div class="sec-head"><h2>Settings</h2></div>
+  <p class="sec-sub">Every environment variable and file-based setting read by <code>config.py</code>, <code>aws.py</code> and <code>mock.py</code>.</p>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Setting</th><th>Default</th><th>What it controls</th></tr></thead>
+    <tbody id="cfg-rows"></tbody>
+  </table></div>
+</section>
+
+<section id="ops">
+  <div class="sec-head"><h2>Demo, ops and access</h2></div>
+  <p class="sec-sub">The scripts that prepare and clean the demo account, the TrueForge agent definition, and the IAM policy that forms the second lock.</p>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Planted by <code>scripts/plant.py</code></th><th>What Warden should conclude</th></tr></thead>
+    <tbody id="plant-rows"></tbody>
+  </table></div>
+  <div class="twocol" style="margin-top:18px">
+    <div class="card"><h3>TrueForge agent</h3><p id="agent-sum"></p><div class="chips" id="agent-tools"></div></div>
+    <div class="card"><h3>IAM policy: <code>iam/warden-policy.json</code></h3><p id="iam-sum"></p><ul id="iam-denies"></ul></div>
+  </div>
+  <h3>Scripts</h3>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Script</th><th>Lines</th><th>What it does</th></tr></thead>
+    <tbody id="script-rows"></tbody>
+  </table></div>
+</section>
+
+<section id="tests">
+  <div class="sec-head"><h2>Tests</h2></div>
+  <p class="sec-sub"><b>491 tests</b> collected by pytest (checked with <code>pytest --collect-only</code> on 28 Sep 2026) from <b id="test-fns"></b> test functions; parametrised cases account for the difference. They run on moto, so no AWS account is needed.</p>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>File</th><th>Test functions</th><th>Lines</th><th>Covers</th></tr></thead>
+    <tbody id="test-rows"></tbody>
+  </table></div>
+</section>
+
+<footer>
+  <h4>Read from</h4>
+  <ul>
+    <li><code>src/warden/*.py</code>: 14 modules, parsed with Python's <code>ast</code> for every signature, line span and call</li>
+    <li><code>scripts/*.py</code> and <code>agent/setup_agent.py</code>: the same way</li>
+    <li>Each block's description written from its source code; docstrings are shown verbatim</li>
+    <li><code>README.md</code>, <code>agent/instructions.md</code>, <code>iam/warden-policy.json</code></li>
+    <li><code>tests/*.py</code>: test function counts; totals from <code>pytest --collect-only</code></li>
+    <li>Diagrams rendered and validated with archify (showcase quality, browser-checked)</li>
+  </ul>
+  <p id="foot-commit"></p>
+</footer>
+</div>
+
+<script>
+var DATA = /*__DATA__*/;
+(function(){
+  var $ = function(id){ return document.getElementById(id); };
+  function esc(s){ return String(s == null ? '' : s).replace(/[&<>"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+  function did(id){ return 'b-' + id.replace(/[^A-Za-z0-9]+/g, '-'); }
+  function mid(id){ return 'm-' + id.replace(/[^A-Za-z0-9]+/g, '-'); }
+  function short(id){ return id.split(':')[1] ? id.split(':')[0].replace(/^warden\./,'').replace(/^scripts\./,'scripts/').replace(/^agent\./,'agent/') + '.' + id.split(':')[1] : id; }
+  var BY = {}; DATA.blocks.forEach(function(b){ BY[b.id] = b; });
+  var MOD = {}; DATA.modules.forEach(function(m){ MOD[m.id] = m; });
+
+  /* ---------- header ---------- */
+  var nBlocks = DATA.blocks.length, kinds = {};
+  DATA.blocks.forEach(function(b){ var k = b.k === 'async function' ? 'function' : b.k; kinds[k] = (kinds[k]||0) + 1; });
+  var srcLines = DATA.modules.reduce(function(a,m){ return a + m.lines; }, 0);
+  var docd = DATA.blocks.filter(function(b){ return b.doc; }).length;
+  var gated = DATA.tools.filter(function(t){ return t.approval; }).length;
+  var testFns = DATA.tests.reduce(function(a,t){ return a + t.tests; }, 0);
+  $('commit').textContent = 'commit ' + DATA.commit.slice(0,7);
+  $('lede-blocks').textContent = nBlocks;
+  var facts = [
+    ['Modules', DATA.modules.length, srcLines.toLocaleString() + ' lines of Python'],
+    ['Code blocks', nBlocks, kinds['function'] + ' functions · ' + kinds['method'] + ' methods · ' + kinds['class'] + ' classes · ' + kinds['nested'] + ' nested'],
+    ['MCP tools', DATA.tools.length, gated + ' behind human approval'],
+    ['Tests', 491, testFns + ' test functions · moto'],
+    ['Resource types', 4, 'disk · snapshot · server · IP'],
+    ['Docstrings', docd + ' / ' + nBlocks, 'every block described below']
+  ];
+  $('facts').innerHTML = facts.map(function(f){ return '<div class="fact"><dt>' + esc(f[0]) + '</dt><dd>' + esc(f[1]) + '<span>' + esc(f[2]) + '</span></dd></div>'; }).join('');
+  $('foot-commit').innerHTML = 'Repository <code>github.com/Anuraggupta07/Trueforge-Hackathon</code>, branch <code>Trueforge_agent</code> (same commit as <code>main</code>), commit <code>' + esc(DATA.commit) + '</code>.';
+
+  function ref(id){ return BY[id] ? '<button type="button" class="lnk" data-go="' + esc(id) + '">' + esc(short(id)) + '</button>' : '<code>' + esc(id) + '</code>'; }
+
+  /* ---------- flows ---------- */
+  var FLOWS = [
+    ['1','AWS → scanner','Volumes, snapshots, instances, addresses, CloudWatch metrics, CloudTrail owners, Recycle Bin rules','warden.scanner:scan'],
+    ['2','Scanner → policy','Resource tags and names, treated as untrusted data','warden.policy:keep_reasons'],
+    ['3','Scanner → plan lock','Certified findings with a fingerprint per resource','warden.plan:save_plan'],
+    ['4','Agent → Watchdog','plan_id, action and resource IDs; the Watchdog re-describes each one itself','warden.watchdog:verify'],
+    ['5','Watchdog → sign-off store','A single-use HMAC slip with a TTL, plus a ledger entry','warden.watchdog:check_signoff'],
+    ['6','TrueForge → action tool','Your Allow; the call arrives with the plan ID and resource IDs','warden.server:quarantine_volumes'],
+    ['7','Action → AWS','Backup snapshot, delete, Recycle Bin tag, stop or quarantine tag, after a per-item re-check','warden.actions:_run_gated'],
+    ['8','Action → ledger','A receipt per call and a hash-chained ledger line','warden.audit:audit'],
+    ['9','Ledger → dashboards and console','Rollback window, receipts, history; read-only','warden.watchdog:rollback_window']
+  ];
+  $('flows').innerHTML = FLOWS.map(function(f){ return '<tr><td class="num">' + f[0] + '</td><td>' + esc(f[1]) + '</td><td>' + esc(f[2]) + '</td><td>' + ref(f[3]) + '</td></tr>'; }).join('');
+
+  /* ---------- diagrams (archify, lazy) ---------- */
+  function theme(){ var t = document.documentElement.getAttribute('data-theme'); if (t === 'dark' || t === 'light') return t; try { return matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'; } catch(e){ return 'light'; } }
+  var holders = Array.prototype.slice.call(document.querySelectorAll('[data-diagram]'));
+  function mount(h){
+    if (h.firstChild) return;
+    var f = document.createElement('iframe');
+    f.title = h.dataset.title; f.loading = 'lazy'; f.setAttribute('allow','fullscreen'); f.setAttribute('allowfullscreen','');
+    f.dataset.theme = theme(); f.src = 'diagrams/' + h.dataset.diagram + '.html?theme=' + f.dataset.theme;
+    h.appendChild(f);
+  }
+  if ('IntersectionObserver' in window) {
+    var io = new IntersectionObserver(function(es){ es.forEach(function(e){ if (e.isIntersecting) { mount(e.target); io.unobserve(e.target); } }); }, {rootMargin:'600px'});
+    holders.forEach(function(h){ io.observe(h); });
+  } else holders.forEach(mount);
+  function syncTheme(){ var t = theme(); holders.forEach(function(h){ var f = h.firstChild; if (f && f.dataset.theme !== t) { f.dataset.theme = t; f.src = 'diagrams/' + h.dataset.diagram + '.html?theme=' + t; } }); }
+  try { new MutationObserver(syncTheme).observe(document.documentElement,{attributes:true,attributeFilter:['data-theme']}); } catch(e){}
+  try { matchMedia('(prefers-color-scheme: dark)').addEventListener('change', syncTheme); } catch(e){}
+  Array.prototype.forEach.call(document.querySelectorAll('.fs'), function(btn){
+    var fig = btn.closest('figure');
+    if (!document.fullscreenEnabled) { btn.hidden = true; return; }
+    btn.addEventListener('click', function(){ var h = fig.querySelector('[data-diagram]'); mount(h); var f = h.firstChild; try { var r = f.requestFullscreen(); if (r && r.catch) r.catch(function(){ btn.hidden = true; }); } catch(e){ btn.hidden = true; } });
+  });
+
+  /* ---------- layers map ---------- */
+  (function(){
+    var NS = 'http://www.w3.org/2000/svg';
+    var W = 1180, bandX = 118, bandW = 784, boxH = 58;
+    var BANDS = [
+      {name:'Entry', sub:'MCP server', y:16, mods:['warden.server','warden.__init__']},
+      {name:'Views', sub:'read-only output', y:118, mods:['warden.console','warden.ui']},
+      {name:'Roles', sub:'collect · judge · verify · act · record', y:220, mods:['warden.scanner','warden.policy','warden.watchdog','warden.actions','warden.audit']},
+      {name:'Core', sub:'plan lock · AWS · settings', y:322, mods:['warden.plan','warden.aws','warden.mock','warden.pricing','warden.config']}
+    ];
+    var RAIL = {x:920, w:244, y:16, groups:[
+      {name:'Demo & ops scripts', mods:['scripts._common','scripts.preflight','scripts.plant','scripts.reset','scripts.mock_server']},
+      {name:'TrueForge setup', mods:['agent.setup_agent']}
+    ]};
+    var ROLE_COL = {'warden.scanner':'var(--accent)','warden.policy':'var(--shield)','warden.watchdog':'var(--shield)','warden.actions':'var(--danger)','warden.audit':'var(--good)'};
+    var ROLE_NAME = {'warden.scanner':'Collector','warden.policy':'Analyst','warden.watchdog':'Watchdog','warden.actions':'Executor','warden.audit':'Ledger','warden.server':'Entry','warden.console':'Console','warden.ui':'Dashboards','warden.plan':'Plan lock','warden.config':'Settings','warden.aws':'boto3','warden.mock':'Simulator','warden.pricing':'Prices','warden.__init__':'Package'};
+    var pos = {};
+    BANDS.forEach(function(b){
+      var n = b.mods.length, gap = 10, w = Math.min(150, (bandW - 24 - gap*(n-1)) / n);
+      var total = n*w + gap*(n-1), x0 = bandX + (bandW - total)/2;
+      b.mods.forEach(function(m,i){ pos[m] = {x:x0 + i*(w+gap), y:b.y + 22, w:w, h:boxH}; });
+    });
+    var ry = RAIL.y + 26;
+    RAIL.groups.forEach(function(g){ ry += 20; g.y = ry - 16; g.mods.forEach(function(m){ pos[m] = {x:RAIL.x + 12, y:ry, w:RAIL.w - 24, h:44}; ry += 52; }); ry += 6; });
+    var H = Math.max(BANDS[3].y + 100, ry + 10);
+    var svg = document.createElementNS(NS,'svg'); svg.setAttribute('viewBox','0 0 ' + W + ' ' + H); svg.setAttribute('role','img');
+    svg.setAttribute('aria-label','Layered map of Warden\'s 20 Python modules with their import edges');
+    function el(t,a,txt){ var e = document.createElementNS(NS,t); for (var k in a) e.setAttribute(k,a[k]); if (txt != null) e.textContent = txt; return e; }
+    BANDS.forEach(function(b){
+      svg.appendChild(el('rect',{x:bandX,y:b.y,width:bandW,height:94,rx:8,'class':'lband'}));
+      svg.appendChild(el('text',{x:bandX-14,y:b.y+42,'text-anchor':'end','class':'lbt'},b.name));
+      svg.appendChild(el('text',{x:bandX-14,y:b.y+58,'text-anchor':'end','class':'lbs'},b.sub.length > 22 ? b.sub.slice(0,22) + '…' : b.sub));
+    });
+    svg.appendChild(el('rect',{x:RAIL.x,y:RAIL.y,width:RAIL.w,height:ry - RAIL.y + 4,rx:8,'class':'lband'}));
+    svg.appendChild(el('text',{x:RAIL.x+12,y:RAIL.y+20,'class':'lbt'},'Outside the server'));
+    RAIL.groups.forEach(function(g){ svg.appendChild(el('text',{x:RAIL.x+12,y:g.y+10,'class':'lbs'},g.name.toUpperCase())); });
+    var edges = el('g',{}), nodes = el('g',{});
+    svg.appendChild(edges); svg.appendChild(nodes);
+    var E = [];
+    DATA.modules.forEach(function(m){ m.imports.forEach(function(t){ if (pos[m.id] && pos[t]) E.push([m.id,t]); }); });
+    E.forEach(function(e){
+      var a = pos[e[0]], b = pos[e[1]], d;
+      var ax = a.x + a.w/2, bx = b.x + b.w/2;
+      if (Math.abs(a.y - b.y) < 5) { var y = a.y + a.h, dy = 26; d = 'M' + ax + ',' + y + ' C' + ax + ',' + (y+dy) + ' ' + bx + ',' + (y+dy) + ' ' + bx + ',' + y; }
+      else if (a.x >= RAIL.x) { var sx = a.x, sy = a.y + a.h/2, tx = b.x + b.w, ty = b.y + b.h/2; d = 'M' + sx + ',' + sy + ' C' + (sx-60) + ',' + sy + ' ' + (tx+60) + ',' + ty + ' ' + tx + ',' + ty; }
+      else if (b.y > a.y) { var y1 = a.y + a.h, y2 = b.y, my = (y1+y2)/2; d = 'M' + ax + ',' + y1 + ' C' + ax + ',' + my + ' ' + bx + ',' + my + ' ' + bx + ',' + y2; }
+      else { var y1b = a.y, y2b = b.y + b.h, myb = (y1b+y2b)/2; d = 'M' + ax + ',' + y1b + ' C' + ax + ',' + myb + ' ' + bx + ',' + myb + ' ' + bx + ',' + y2b; }
+      var p = el('path',{d:d,'class':'edge'}); p.dataset.from = e[0]; p.dataset.to = e[1]; edges.appendChild(p);
+    });
+    Object.keys(pos).forEach(function(id){
+      var p = pos[id], m = MOD[id]; if (!m) return;
+      var g = el('g',{'class':'mbox',tabindex:0,role:'button','aria-label':id + ', ' + m.lines + ' lines, ' + m.count + ' blocks. Open in inventory.'});
+      var col = ROLE_COL[id] || 'var(--line)';
+      g.appendChild(el('rect',{x:p.x,y:p.y,width:p.w,height:p.h,rx:6,fill:'var(--surface)',stroke:col}));
+      var label = id.replace(/^warden\./,'').replace(/^scripts\./,'scripts/').replace(/^agent\./,'agent/');
+      if (p.h > 50) {
+        g.appendChild(el('text',{x:p.x+10,y:p.y+17,'class':'mr',fill:ROLE_COL[id] || 'var(--ink-3)'},ROLE_NAME[id] || ''));
+        g.appendChild(el('text',{x:p.x+10,y:p.y+34,'class':'mn'},label + '.py'));
+        g.appendChild(el('text',{x:p.x+10,y:p.y+49,'class':'ms'},m.count + ' blocks · ' + m.lines + ' lines'));
+      } else {
+        g.appendChild(el('text',{x:p.x+10,y:p.y+19,'class':'mn'},label + '.py'));
+        g.appendChild(el('text',{x:p.x+10,y:p.y+34,'class':'ms'},m.lines + ' lines · ' + m.count + ' blocks'));
+      }
+      function on(){ Array.prototype.forEach.call(edges.childNodes, function(ed){ ed.classList.toggle('on-out', ed.dataset.from === id); ed.classList.toggle('on-in', ed.dataset.to === id); });
+        Array.prototype.forEach.call(nodes.childNodes, function(n){ var nid = n.dataset.id; var linked = nid === id || E.some(function(e){ return (e[0] === id && e[1] === nid) || (e[1] === id && e[0] === nid); }); n.classList.toggle('dim', !linked); }); }
+      function off(){ Array.prototype.forEach.call(edges.childNodes, function(ed){ ed.classList.remove('on-out','on-in'); }); Array.prototype.forEach.call(nodes.childNodes, function(n){ n.classList.remove('dim'); }); }
+      g.dataset.id = id;
+      g.addEventListener('mouseenter', on); g.addEventListener('mouseleave', off); g.addEventListener('focus', on); g.addEventListener('blur', off);
+      function open(){ $('f-mod').value = id; applyFilters(); var t = $(mid(id)); if (t) t.scrollIntoView({behavior:'smooth', block:'start'}); }
+      g.addEventListener('click', open); g.addEventListener('keydown', function(e){ if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
+      nodes.appendChild(g);
+    });
+    $('layers-svg').appendChild(svg);
+  })();
+
+  /* ---------- tools ---------- */
+  function group(t){
+    var n = t.name;
+    if (/^(restore_|start_instances|cancel_address_quarantine)/.test(n)) return ['Undo','p-undo'];
+    if (n === 'release_address' || n === 'delete_snapshot_permanently') return ['Permanent','p-final'];
+    if (n === 'watchdog_verify') return ['Verify','p-verify'];
+    if (t.approval) return ['Act','p-act'];
+    return ['Read','p-read'];
+  }
+  $('tool-rows').innerHTML = DATA.tools.map(function(t){
+    var g = group(t);
+    return '<tr><td>' + ref(t.id).replace(esc(short(t.id)), esc(t.name)) + '</td><td><span class="pill ' + g[1] + '">' + g[0] + '</span></td><td>' + (t.approval ? '<span class="pill p-final">Allow / Deny</span>' : '<span class="pill p-read">none</span>') + '</td><td>' + esc(t.what) + (t.detail ? '<br><span style="color:var(--ink-3);font-size:12.5px">' + esc(t.detail) + '</span>' : '') + '</td><td class="num" style="white-space:normal;font-size:11px">' + esc(t.annotations) + '</td></tr>';
+  }).join('');
+
+  /* ---------- inventory ---------- */
+  var ORDER = ['warden.server','warden.__init__','warden.scanner','warden.policy','warden.plan','warden.watchdog','warden.actions','warden.audit','warden.ui','warden.console','warden.aws','warden.mock','warden.config','warden.pricing','agent.setup_agent','scripts._common','scripts.preflight','scripts.plant','scripts.reset','scripts.mock_server'];
+  var GROUPS = [['Server','warden.server','warden.__init__'],['Roles','warden.scanner','warden.policy','warden.plan','warden.watchdog','warden.actions','warden.audit'],['Views','warden.ui','warden.console'],['Core','warden.aws','warden.mock','warden.config','warden.pricing'],['Outside the server','agent.setup_agent','scripts._common','scripts.preflight','scripts.plant','scripts.reset','scripts.mock_server']];
+  var TOOLSET = {}; DATA.tools.forEach(function(t){ TOOLSET[t.id] = t.name; });
+  var tagCounts = {}; DATA.blocks.forEach(function(b){ b.t.forEach(function(t){ tagCounts[t] = (tagCounts[t]||0) + 1; }); });
+  Object.keys(tagCounts).sort(function(a,b){ return tagCounts[b] - tagCounts[a]; }).forEach(function(t){ var o = document.createElement('option'); o.value = t; o.textContent = t + ' (' + tagCounts[t] + ')'; $('f-tag').appendChild(o); });
+  ORDER.forEach(function(id){ var o = document.createElement('option'); o.value = id; o.textContent = id + ' (' + MOD[id].count + ')'; $('f-mod').appendChild(o); });
+
+  var side = $('side');
+  var sideAll = document.createElement('button'); sideAll.type = 'button'; sideAll.innerHTML = 'All modules <span>' + nBlocks + '</span>'; sideAll.dataset.mod = ''; side.appendChild(sideAll);
+  GROUPS.forEach(function(g){ var h = document.createElement('div'); h.className = 'grp'; h.textContent = g[0]; side.appendChild(h);
+    g.slice(1).forEach(function(id){ var b = document.createElement('button'); b.type = 'button'; b.dataset.mod = id; b.innerHTML = esc(id.replace(/^warden\./,'')) + ' <span>' + MOD[id].count + '</span>'; side.appendChild(b); }); });
+  side.addEventListener('click', function(e){ var b = e.target.closest('button'); if (!b) return; $('f-mod').value = b.dataset.mod; applyFilters(); var t = b.dataset.mod ? $(mid(b.dataset.mod)) : $('inventory'); if (t) t.scrollIntoView({behavior:'smooth', block:'start'}); });
+
+  function kindLabel(b){ if (TOOLSET[b.id]) return ['MCP tool','tool']; if (b.k === 'class') return ['class','cls']; if (b.k === 'async function') return ['async fn','']; if (b.k === 'nested') return ['nested','']; return [b.k === 'method' ? 'method' : 'function','']; }
+  function tagHtml(b){ return b.t.filter(function(t){ return t !== 'helper'; }).map(function(t){ return '<span class="tg t-' + esc(t) + '">' + esc(t) + '</span>'; }).join(''); }
+  function body(b){
+    var m = MOD[b.m], parts = [];
+    var head = b.k === 'class' ? 'class ' + b.n + (b.bases.length ? '(' + b.bases.join(', ') + ')' : '') : (b.k === 'async function' ? 'async def ' : 'def ') + b.n + b.s;
+    parts.push('<pre>' + esc((b.dec.length ? b.dec.map(function(d){ return '@' + d; }).join('\n') + '\n' : '') + head) + '</pre>');
+    var kv = '<dl class="kv">';
+    if (b.d) kv += '<dt>Detail</dt><dd>' + esc(b.d) + '</dd>';
+    kv += '<dt>Location</dt><dd><code>' + esc(m.path) + ':' + b.l + '–' + b.e + '</code> · ' + (b.e - b.l + 1) + ' lines</dd>';
+    if (TOOLSET[b.id]) kv += '<dt>MCP tool</dt><dd><code>' + esc(TOOLSET[b.id]) + '</code></dd>';
+    if (b.p) kv += '<dt>Inside</dt><dd>' + ref(b.p) + '</dd>';
+    if (b.fields && b.fields.length) kv += '<dt>Fields</dt><dd>' + b.fields.map(function(f){ return '<code>' + esc(f) + '</code>'; }).join(' ') + '</dd>';
+    kv += '<dt>Calls</dt><dd>' + (b.c.length ? '<span class="chips">' + b.c.map(ref).join(' ') + '</span>' : '<span style="color:var(--ink-3)">no other Warden blocks</span>') + '</dd>';
+    kv += '<dt>Called by</dt><dd>' + (b.cb.length ? '<span class="chips">' + b.cb.map(ref).join(' ') + '</span>' : '<span style="color:var(--ink-3)">' + (TOOLSET[b.id] ? 'MCP clients (TrueForge)' : (b.dec.length ? 'the framework, via its decorator' : 'nothing inside Warden (entry point, test hook or framework callback)')) + '</span>') + '</dd>';
+    if (b.r.length) kv += '<dt>Raises</dt><dd>' + b.r.map(function(r){ return '<code>' + esc(r) + '</code>'; }).join(' ') + '</dd>';
+    kv += '</dl>';
+    parts.push(kv);
+    if (b.doc) parts.push('<pre class="doc">' + esc(b.doc) + '</pre>');
+    return parts.join('');
+  }
+  var list = $('inv-list'), rows = [];
+  ORDER.forEach(function(id){
+    var m = MOD[id];
+    var card = document.createElement('div'); card.className = 'modcard'; card.id = mid(id); card.dataset.mod = id;
+    var consts = m.constants.length ? '<details class="consts"><summary>' + m.constants.length + ' module-level constant' + (m.constants.length === 1 ? '' : 's') + '</summary><table>' + m.constants.map(function(c){ return '<tr><td style="white-space:nowrap">' + esc(c.name) + '</td><td>' + esc(c.value) + '</td><td class="num">:' + c.line + '</td></tr>'; }).join('') + '</table></details>' : '';
+    card.innerHTML = '<div class="modhead"><div class="row1"><h3>' + esc(m.path) + '</h3><span class="role">' + esc(m.role) + '</span><span class="meta">' + m.lines + ' lines · ' + m.count + ' blocks</span></div><p>' + esc(m.summary) + '</p>' +
+      '<div class="deps"><span><b>Imports from Warden:</b> ' + (m.imports.length ? m.imports.map(function(x){ return '<code>' + esc(x) + '</code>'; }).join(' ') : 'nothing') + '</span><span><b>External:</b> ' + (m.external.length ? esc(m.external.join(', ')) : 'none') + '</span></div></div>' + consts;
+    var own = DATA.blocks.filter(function(b){ return b.m === id; });
+    var top = own.filter(function(b){ return !b.p; }).sort(function(a,b){ return a.l - b.l; });
+    function addRow(b, depth){
+      var kl = kindLabel(b);
+      var d = document.createElement('details'); d.className = 'blk' + (depth === 1 ? ' sub' : depth > 1 ? ' sub2' : ''); d.id = did(b.id);
+      d.innerHTML = '<summary><span class="kb ' + kl[1] + '">' + esc(kl[0]) + '</span><span class="bn">' + esc(b.k === 'nested' ? b.q.replace('.<locals>.', ' › ') : b.q) + '</span><span class="bw">' + esc(b.w) + tagHtml(b) + '</span></summary>';
+      d.addEventListener('toggle', function(){ if (d.open && !d.dataset.filled) { var x = document.createElement('div'); x.className = 'bd'; x.innerHTML = body(b); d.appendChild(x); d.dataset.filled = '1'; } });
+      card.appendChild(d);
+      var hay = (b.id + ' ' + b.q + ' ' + b.w + ' ' + b.d + ' ' + b.doc + ' ' + b.s + ' ' + (TOOLSET[b.id]||'') + ' ' + b.t.join(' ')).toLowerCase();
+      rows.push({el:d, b:b, hay:hay, card:card});
+      own.filter(function(x){ return x.p === b.id; }).sort(function(a,c){ return a.l - c.l; }).forEach(function(c){ addRow(c, depth + 1); });
+    }
+    top.forEach(function(b){ addRow(b, 0); });
+    list.appendChild(card);
+  });
+  var none = document.createElement('p'); none.className = 'none'; none.textContent = 'No blocks match. Clear the search or filters.'; none.hidden = true; list.appendChild(none);
+
+  function applyFilters(){
+    var q = $('q').value.trim().toLowerCase(), k = $('f-kind').value, t = $('f-tag').value, md = $('f-mod').value, shown = 0;
+    var cards = {};
+    rows.forEach(function(r){
+      var kk = r.b.k === 'async function' ? 'function' : r.b.k;
+      var ok = (!q || q.split(/\s+/).every(function(w){ return r.hay.indexOf(w) >= 0; })) && (!k || kk === k) && (!t || r.b.t.indexOf(t) >= 0) && (!md || r.b.m === md);
+      r.el.hidden = !ok; if (ok) { shown++; cards[r.b.m] = true; }
+    });
+    Array.prototype.forEach.call(list.querySelectorAll('.modcard'), function(c){ c.hidden = !cards[c.dataset.mod]; });
+    none.hidden = shown > 0;
+    $('count').textContent = 'Showing ' + shown + ' of ' + nBlocks + ' blocks' + (md ? ' in ' + md : '') + '.';
+    Array.prototype.forEach.call(side.querySelectorAll('button'), function(b){ b.setAttribute('aria-pressed', (b.dataset.mod || '') === md ? 'true' : 'false'); });
+  }
+  ['q','f-kind','f-tag','f-mod'].forEach(function(id){ $(id).addEventListener(id === 'q' ? 'input' : 'change', applyFilters); });
+  var expanded = false;
+  $('exp').addEventListener('click', function(){ expanded = !expanded; rows.forEach(function(r){ if (!r.el.hidden) r.el.open = expanded; }); this.textContent = expanded ? 'Collapse all' : 'Expand all'; });
+  applyFilters();
+
+  function go(id){
+    var r = rows.filter(function(x){ return x.b.id === id; })[0]; if (!r) return;
+    if (r.el.hidden) { $('q').value = ''; $('f-kind').value = ''; $('f-tag').value = ''; $('f-mod').value = ''; applyFilters(); }
+    r.el.open = true; r.el.scrollIntoView({behavior:'smooth', block:'start'});
+    r.el.classList.remove('flash'); void r.el.offsetWidth; r.el.classList.add('flash');
+    try { history.replaceState(null,'','#' + did(id)); } catch(e){}
+  }
+  document.addEventListener('click', function(e){ var a = e.target.closest('[data-go]'); if (a) { e.preventDefault(); go(a.dataset.go); } });
+  if (location.hash.indexOf('#b-') === 0) { var want = location.hash.slice(1); var hit = rows.filter(function(r){ return r.el.id === want; })[0]; if (hit) setTimeout(function(){ go(hit.b.id); }, 200); }
+
+  /* ---------- invariants ---------- */
+  var INV = [
+    ['Actions touch only IDs the scanner certified','The locked plan is saved per scan. Every action request is checked against it: unknown actions, expired or missing plans, account or region mismatch, wildcards and unplanned IDs are rejected.',['warden.plan:validate_request','warden.plan:load_plan','warden.actions:_run_gated']],
+    ['No change without a fresh Watchdog slip','The Watchdog re-describes every item with its own AWS calls and signs an HMAC-SHA256 slip over plan, action, IDs and fingerprints. The Executor consumes it once; it expires after WARDEN_SIGNOFF_TTL_MINUTES.',['warden.watchdog:verify','warden.watchdog:check_signoff','warden.actions:_check_signoff']],
+    ['A person approves every action and undo','TrueForge pauses on the 10 gated tools listed in require_approval_for_tools.',['agent.setup_agent:build_warden_manifest','agent.setup_agent:_mcp_entry']],
+    ['Anything that changed since the scan is skipped','A fingerprint of state and tags is taken at scan time and compared again by the Watchdog and by the Executor right before each item; a server that became busy is skipped.',['warden.plan:fingerprint','warden.watchdog:_check_item','warden.actions:_recheck','warden.actions:_became_active']],
+    ['Protected, managed and instruction-like resources are never proposed','Tags are data: production and legal-hold tags, IaC or autoscaling ownership, and tag text that reads like orders all become keep reasons. Production-looking names are downgraded to review.',['warden.policy:protection_reasons','warden.policy:keep_reasons','warden.policy:injection_reasons','warden.scanner:_prod_guard']],
+    ['The freeze switch stops every change','WARDEN_FREEZE or a FREEZE file in the state directory; checked before the batch and again before every item.',['warden.config:is_frozen','warden.actions:_frozen','warden.actions:_run_gated','warden.actions:_run_simple']],
+    ['Warden stays inside its scope tag','WARDEN_SCOPE_TAG (key=value) limits every scan, re-check and undo to tagged resources; the demo uses warden:demo=true.',['warden.config:_scope','warden.actions:_recheck','warden.watchdog:_check_item']],
+    ['Permanent steps are one item at a time','The plan rejects more than one ID for irreversible actions. An IP is released only after Warden\'s own recorded quarantine window, with no association and no DNS record pointing at it.',['warden.plan:validate_request','warden.actions:_release_one','warden.audit:quarantine_problem','warden.watchdog:_action_check']],
+    ['History is tamper-evident','Every scan, sign-off and action is a hash-chained ledger line anchored in ledger.head; edits, deletions, re-ordering and truncation are detected.',['warden.audit:audit','warden.audit:verify_ledger']],
+    ['Warden\'s own backups don\'t become new waste','Backup snapshots carry an expiry of now plus WARDEN_BACKUP_RETENTION_DAYS, and the rollback window counts it down.',['warden.actions:_backup_tags','warden.watchdog:_backups']],
+    ['Servers are stopped, never terminated','stop_instances only stops. The source contains no TerminateInstances, S3 bucket-delete or KMS calls (checked with grep), and the IAM policy denies them in AWS as well.',['warden.actions:_stop_one','warden.server:stop_instances']]
+  ];
+  $('inv-rows').innerHTML = INV.map(function(r){ return '<tr><td><b>' + esc(r[0]) + '</b></td><td>' + esc(r[1]) + '</td><td><span class="chips">' + r[2].map(ref).join(' ') + '</span></td></tr>'; }).join('');
+
+  /* ---------- settings ---------- */
+  $('cfg-rows').innerHTML = DATA.config.map(function(c){ return '<tr><td><code>' + esc(c.name) + '</code></td><td class="num" style="white-space:normal">' + esc(c['default'] || '—') + '</td><td>' + esc(c.meaning) + '</td></tr>'; }).join('');
+
+  /* ---------- ops ---------- */
+  $('plant-rows').innerHTML = DATA.planted.map(function(p){ return '<tr><td>' + esc(p.item) + '</td><td>' + esc(p.why) + '</td></tr>'; }).join('');
+  $('agent-sum').textContent = DATA.agent.summary;
+  $('agent-tools').innerHTML = DATA.agent.approval_tools.map(function(t){ return '<code>' + esc(t) + '</code>'; }).join(' ');
+  $('iam-sum').textContent = DATA.iam.summary;
+  $('iam-denies').innerHTML = DATA.iam.denies.map(function(d){ return '<li>' + esc(d) + '</li>'; }).join('');
+  $('script-rows').innerHTML = ['scripts.preflight','scripts.plant','scripts.reset','scripts.mock_server','scripts._common','agent.setup_agent'].map(function(id){ var m = MOD[id]; return '<tr><td><button type="button" class="lnk" data-mod="' + esc(id) + '">' + esc(m.path) + '</button></td><td class="num">' + m.lines + '</td><td>' + esc(m.summary) + '</td></tr>'; }).join('');
+  $('script-rows').addEventListener('click', function(e){ var b = e.target.closest('[data-mod]'); if (!b) return; $('f-mod').value = b.dataset.mod; applyFilters(); $(mid(b.dataset.mod)).scrollIntoView({behavior:'smooth', block:'start'}); });
+
+  /* ---------- tests ---------- */
+  $('test-fns').textContent = testFns;
+  $('test-rows').innerHTML = DATA.tests.filter(function(t){ return t.tests > 0 || t.path.indexOf('conftest') >= 0; }).map(function(t){ return '<tr><td><code>' + esc(t.path) + '</code></td><td class="num">' + (t.tests || '—') + '</td><td class="num">' + t.lines + '</td><td>' + esc(t.doc || (t.path.indexOf('conftest') >= 0 ? 'Shared fixtures (moto AWS, isolated state directory)' : '')) + '</td></tr>'; }).join('');
+})();
+</script>

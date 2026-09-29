@@ -1,0 +1,317 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Warden: system context",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "chat-path",
+        "label": "You, TrueForge, Warden",
+        "focus": [
+          "operator",
+          "trueforge",
+          "gateway",
+          "server"
+        ],
+        "note": "You talk to a TrueForge agent; the agent reaches AWS only through Warden's MCP tools."
+      },
+      {
+        "id": "safety-path",
+        "label": "Sign-off and record",
+        "focus": [
+          "server",
+          "watchdog",
+          "state"
+        ],
+        "note": "The Watchdog re-reads AWS and signs a single-use slip; every step lands in the hash-chained ledger."
+      },
+      {
+        "id": "cloud-path",
+        "label": "AWS or the simulator",
+        "focus": [
+          "server",
+          "aws",
+          "iam",
+          "moto"
+        ],
+        "note": "boto3 under a least-privilege IAM policy, or the local moto simulator for the demo."
+      },
+      {
+        "id": "side-path",
+        "label": "Sandbox and console",
+        "focus": [
+          "trueforge",
+          "daytona",
+          "console",
+          "operator"
+        ],
+        "note": "Proof scripts run in Daytona; the read-only console shows live state next to the chat."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "gateway",
+      "type": "cloud",
+      "label": "TrueFoundry AI Gateway",
+      "sublabel": "the model",
+      "pos": [
+        300,
+        60
+      ],
+      "size": [
+        190,
+        62
+      ]
+    },
+    {
+      "id": "iam",
+      "type": "security",
+      "label": "IAM policy",
+      "sublabel": "deny on production",
+      "pos": [
+        930,
+        60
+      ],
+      "size": [
+        190,
+        62
+      ]
+    },
+    {
+      "id": "operator",
+      "type": "external",
+      "label": "You (operator)",
+      "sublabel": "browser",
+      "pos": [
+        30,
+        270
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "trueforge",
+      "type": "frontend",
+      "label": "TrueForge chat",
+      "sublabel": ":8790 · Allow / Deny",
+      "tag": "agent",
+      "pos": [
+        300,
+        270
+      ],
+      "size": [
+        190,
+        64
+      ]
+    },
+    {
+      "id": "server",
+      "type": "backend",
+      "label": "Warden MCP server",
+      "sublabel": ":8000/mcp · 19 tools",
+      "tag": "server.py",
+      "pos": [
+        610,
+        270
+      ],
+      "size": [
+        200,
+        64
+      ]
+    },
+    {
+      "id": "aws",
+      "type": "cloud",
+      "label": "AWS APIs",
+      "sublabel": "EC2 · CW · CloudTrail · RBin",
+      "tag": "real mode",
+      "pos": [
+        930,
+        270
+      ],
+      "size": [
+        190,
+        64
+      ]
+    },
+    {
+      "id": "console",
+      "type": "frontend",
+      "label": "Warden Console",
+      "sublabel": "served by Warden · read-only",
+      "tag": "console.py",
+      "pos": [
+        30,
+        470
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "daytona",
+      "type": "cloud",
+      "label": "Daytona sandbox",
+      "sublabel": "proof scripts",
+      "pos": [
+        300,
+        470
+      ],
+      "size": [
+        190,
+        64
+      ]
+    },
+    {
+      "id": "watchdog",
+      "type": "security",
+      "label": "Watchdog",
+      "sublabel": "HMAC single-use slip",
+      "tag": "watchdog.py",
+      "pos": [
+        610,
+        440
+      ],
+      "size": [
+        200,
+        64
+      ]
+    },
+    {
+      "id": "state",
+      "type": "database",
+      "label": ".warden state",
+      "sublabel": "ledger · receipts · plan",
+      "tag": "audit.py",
+      "pos": [
+        610,
+        572
+      ],
+      "size": [
+        200,
+        64
+      ]
+    },
+    {
+      "id": "moto",
+      "type": "external",
+      "label": "AWS simulator",
+      "sublabel": "moto :5000",
+      "tag": "demo mode",
+      "pos": [
+        930,
+        470
+      ],
+      "size": [
+        190,
+        64
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "AWS account",
+      "wraps": [
+        "iam",
+        "aws"
+      ],
+      "pad": 18
+    }
+  ],
+  "connections": [
+    {
+      "from": "operator",
+      "to": "trueforge",
+      "label": "chat",
+      "variant": "emphasis"
+    },
+    {
+      "from": "trueforge",
+      "to": "gateway",
+      "label": "model calls"
+    },
+    {
+      "from": "trueforge",
+      "to": "server",
+      "label": "MCP · HTTP",
+      "variant": "emphasis"
+    },
+    {
+      "from": "server",
+      "to": "aws",
+      "label": "boto3",
+      "variant": "emphasis"
+    },
+    {
+      "from": "iam",
+      "to": "aws",
+      "label": "denies",
+      "variant": "security",
+      "labelDy": 24
+    },
+    {
+      "from": "server",
+      "to": "watchdog",
+      "label": "verify",
+      "variant": "security",
+      "labelDy": 30
+    },
+    {
+      "from": "watchdog",
+      "to": "state",
+      "label": "sign-off",
+      "labelDy": 42
+    },
+    {
+      "from": "server",
+      "to": "moto",
+      "label": "mock endpoint",
+      "variant": "dashed"
+    },
+    {
+      "from": "trueforge",
+      "to": "daytona",
+      "label": "run code",
+      "labelDy": 80
+    },
+    {
+      "from": "operator",
+      "to": "console",
+      "label": "watches",
+      "labelDy": 80
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "One path to AWS",
+      "items": [
+        "The agent reaches AWS only through Warden's MCP tools",
+        "AWS keys stay inside the Warden server"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Two independent checks",
+      "items": [
+        "The Watchdog signs a single-use slip before any change",
+        "TrueForge pauses for Allow on every action tool"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Everything recorded",
+      "items": [
+        "Receipts and a hash-chained ledger in .warden",
+        "The console only reads; it never changes AWS"
+      ]
+    }
+  ]
+}

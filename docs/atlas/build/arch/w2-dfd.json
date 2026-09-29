@@ -1,0 +1,270 @@
+{
+  "schema_version": 1,
+  "diagram_type": "dataflow",
+  "meta": {
+    "title": "Warden: how one cleanup flows",
+    "locale": "en",
+    "viewBox": [
+      1080,
+      628
+    ],
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "collect",
+        "label": "Scan and judge",
+        "focus": [
+          "aws_in",
+          "scan",
+          "policy",
+          "plan"
+        ],
+        "note": "Read-only scan; tags are judged as data, and only certified IDs enter the locked plan."
+      },
+      {
+        "id": "verify",
+        "label": "Sign-off and approval",
+        "focus": [
+          "plan",
+          "wd",
+          "allow",
+          "exec"
+        ],
+        "note": "The action runs only with a valid single-use slip and your Allow in TrueForge."
+      },
+      {
+        "id": "record",
+        "label": "Change and record",
+        "focus": [
+          "exec",
+          "aws_out",
+          "ledger",
+          "ui"
+        ],
+        "note": "Backup first, then the change; every call leaves a receipt in the hash-chained ledger."
+      }
+    ]
+  },
+  "stages": [
+    {
+      "label": "AWS (read)"
+    },
+    {
+      "label": "Collect + judge"
+    },
+    {
+      "label": "Lock + verify"
+    },
+    {
+      "label": "Approve + act"
+    },
+    {
+      "label": "Record"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "aws_in",
+      "type": "external",
+      "label": "AWS reads",
+      "sublabel": "describe · metrics",
+      "stage": 0,
+      "row": 0,
+      "tag": "read-only",
+      "width": 128,
+      "height": 60
+    },
+    {
+      "id": "scan",
+      "type": "backend",
+      "label": "scan_for_waste",
+      "sublabel": "scanner.py",
+      "stage": 1,
+      "row": 0,
+      "tag": "Collector",
+      "width": 128,
+      "height": 60
+    },
+    {
+      "id": "policy",
+      "type": "security",
+      "label": "Policy",
+      "sublabel": "tags are data",
+      "stage": 1,
+      "row": 1,
+      "tag": "Analyst",
+      "width": 128,
+      "height": 60
+    },
+    {
+      "id": "plan",
+      "type": "database",
+      "label": "Locked plan",
+      "sublabel": "certified IDs",
+      "stage": 2,
+      "row": 0,
+      "tag": "plan.py",
+      "width": 128,
+      "height": 60
+    },
+    {
+      "id": "wd",
+      "type": "security",
+      "label": "watchdog_verify",
+      "sublabel": "re-read + HMAC",
+      "stage": 2,
+      "row": 1,
+      "tag": "Watchdog",
+      "width": 128,
+      "height": 60
+    },
+    {
+      "id": "allow",
+      "type": "frontend",
+      "label": "Allow / Deny",
+      "sublabel": "TrueForge card",
+      "stage": 3,
+      "row": 0,
+      "tag": "human",
+      "width": 128,
+      "height": 60
+    },
+    {
+      "id": "exec",
+      "type": "backend",
+      "label": "Action tool",
+      "sublabel": "re-check first",
+      "stage": 3,
+      "row": 1,
+      "tag": "Executor",
+      "width": 128,
+      "height": 60
+    },
+    {
+      "id": "aws_out",
+      "type": "cloud",
+      "label": "AWS change",
+      "sublabel": "backup first",
+      "stage": 4,
+      "row": 0,
+      "tag": "reversible",
+      "width": 128,
+      "height": 60
+    },
+    {
+      "id": "ledger",
+      "type": "database",
+      "label": "Receipt + ledger",
+      "sublabel": "hash-chained",
+      "stage": 4,
+      "row": 2,
+      "tag": "audit.py",
+      "width": 128,
+      "height": 60
+    },
+    {
+      "id": "ui",
+      "type": "frontend",
+      "label": "Dashboard",
+      "sublabel": "from Warden data",
+      "stage": 4,
+      "row": 3,
+      "tag": "ui.py",
+      "width": 128,
+      "height": 60,
+      "yOffset": -12
+    }
+  ],
+  "flows": [
+    {
+      "id": "read",
+      "from": "aws_in",
+      "to": "scan",
+      "label": "resources",
+      "variant": "emphasis"
+    },
+    {
+      "id": "judge",
+      "from": "scan",
+      "to": "policy",
+      "label": "findings",
+      "labelDy": 24
+    },
+    {
+      "id": "verdicts",
+      "from": "policy",
+      "to": "plan",
+      "label": "certified"
+    },
+    {
+      "id": "slip",
+      "from": "wd",
+      "to": "exec",
+      "label": "slip",
+      "variant": "security"
+    },
+    {
+      "id": "check",
+      "from": "plan",
+      "to": "wd",
+      "label": "IDs",
+      "variant": "security",
+      "labelDy": 24
+    },
+    {
+      "id": "approve",
+      "from": "allow",
+      "to": "exec",
+      "label": "Allow",
+      "variant": "emphasis",
+      "labelDy": 24
+    },
+    {
+      "id": "change",
+      "from": "exec",
+      "to": "aws_out",
+      "label": "boto3",
+      "variant": "emphasis"
+    },
+    {
+      "id": "receipt",
+      "from": "exec",
+      "to": "ledger",
+      "label": "receipt"
+    },
+    {
+      "id": "show",
+      "from": "ledger",
+      "to": "ui",
+      "label": "state",
+      "variant": "dashed",
+      "labelDy": 24
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Only certified IDs",
+      "items": [
+        "The plan lock holds the IDs the scanner certified",
+        "An action on any other ID is refused"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Two keys to act",
+      "items": [
+        "A single-use HMAC slip from the Watchdog",
+        "Your Allow on the TrueForge approval card"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Undo is built in",
+      "items": [
+        "Backups, Recycle Bin and stop, never terminate",
+        "Receipts drive restore and the rollback window"
+      ]
+    }
+  ]
+}
